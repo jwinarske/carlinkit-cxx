@@ -1,0 +1,9 @@
+/build/
+/capture/*.pcap
+/capture/*.pcapng
+/capture/.current
+/capture/.tcpdump.log
+compile_commands.json
+/reference/
+/out.h264
+/out.pcm

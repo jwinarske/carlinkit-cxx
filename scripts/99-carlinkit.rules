@@ -1,0 +1,9 @@
+# Carlinkit "Auto Box" CarPlay dongles — grant non-root access so libusb can
+# claim the interface. The node is owned by the "dialout" group (mode 0660, not
+# world-writable) and also tagged "uaccess" so the logged-in user on the local
+# seat (a head unit) gets access via ACL. For headless/SSH use, add your user to
+# the dialout group:  sudo usermod -aG dialout "$USER"  (re-login to take effect).
+# Install:  sudo cp scripts/99-carlinkit.rules /etc/udev/rules.d/
+#           sudo udevadm control --reload && sudo udevadm trigger
+SUBSYSTEM=="usb", ATTR{idVendor}=="1314", ATTR{idProduct}=="1520", MODE="0660", GROUP="dialout", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="1314", ATTR{idProduct}=="1521", MODE="0660", GROUP="dialout", TAG+="uaccess"

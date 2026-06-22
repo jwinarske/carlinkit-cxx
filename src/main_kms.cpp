@@ -20,6 +20,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -27,6 +28,7 @@
 #include <vector>
 
 #include <drm_fourcc.h>
+#include <drm_mode.h>
 #include <xf86drmMode.h>
 
 #include <drm-cxx/core/device.hpp>
@@ -78,8 +80,106 @@ uint32_t computed_dpi(int fd, uint32_t connector_id, uint32_t hdisplay) {
   return dpi;
 }
 
-// Print the connector's available modes (for --drm-list-modes), so the user can
-// pick one to cycle through with --drm-mode.
+// ── Plane rotation ──────────────────────────────────────────────────────────
+// Supported rotation bits on a plane, from its "rotation" bitmask property
+// (DRM_MODE_ROTATE_*/REFLECT_*). 0 if the plane exposes no rotation property.
+uint64_t plane_rotation_bits(int fd, uint32_t plane_id) {
+  uint64_t bits = 0;
+  drmModeObjectProperties* props =
+      drmModeObjectGetProperties(fd, plane_id, DRM_MODE_OBJECT_PLANE);
+  if (props != nullptr) {
+    for (uint32_t i = 0; i < props->count_props; ++i) {
+      drmModePropertyRes* pr = drmModeGetProperty(fd, props->props[i]);
+      if (pr != nullptr) {
+        if (std::strcmp(pr->name, "rotation") == 0 &&
+            (pr->flags & DRM_MODE_PROP_BITMASK) != 0)
+          for (int e = 0; e < pr->count_enums; ++e)
+            bits |= 1ULL << pr->enums[e].value;  // enum value = the bit index
+        drmModeFreeProperty(pr);
+      }
+    }
+    drmModeFreeObjectProperties(props);
+  }
+  return bits;
+}
+
+// CRTCs (bitmask, drmModeRes->crtcs order) this connector's encoders can drive.
+uint32_t connector_crtc_mask(int fd, uint32_t connector_id) {
+  uint32_t mask = 0;
+  drmModeConnector* c = drmModeGetConnector(fd, connector_id);
+  if (c != nullptr) {
+    for (int e = 0; e < c->count_encoders; ++e) {
+      drmModeEncoder* enc = drmModeGetEncoder(fd, c->encoders[e]);
+      if (enc != nullptr) {
+        mask |= enc->possible_crtcs;
+        drmModeFreeEncoder(enc);
+      }
+    }
+    drmModeFreeConnector(c);
+  }
+  return mask;
+}
+
+// Rotation bits supported by some NV12-capable plane that can drive
+// `connector`.
+uint64_t connector_rotation_caps(int fd, uint32_t connector_id) {
+  const uint32_t cmask = connector_crtc_mask(fd, connector_id);
+  uint64_t bits = 0;
+  drmModePlaneRes* pr = drmModeGetPlaneResources(fd);
+  for (uint32_t i = 0; pr != nullptr && i < pr->count_planes; ++i) {
+    drmModePlane* pl = drmModeGetPlane(fd, pr->planes[i]);
+    if (pl == nullptr)
+      continue;
+    bool nv12 = false;
+    for (uint32_t f = 0; f < pl->count_formats; ++f)
+      if (pl->formats[f] == DRM_FORMAT_NV12)
+        nv12 = true;
+    if (nv12 && (pl->possible_crtcs & cmask) != 0)
+      bits |= plane_rotation_bits(fd, pl->plane_id);
+    drmModeFreePlane(pl);
+  }
+  if (pr != nullptr)
+    drmModeFreePlaneResources(pr);
+  return bits;
+}
+
+// Human list of the angles in a rotation bitmask, for --drm-list-modes.
+std::string rotation_angles_str(uint64_t bits) {
+  if (bits == 0)
+    return "none (no plane rotation property)";
+  std::string s;
+  const std::pair<uint64_t, const char*> angles[] = {
+      {DRM_MODE_ROTATE_0, "0"},
+      {DRM_MODE_ROTATE_90, "90"},
+      {DRM_MODE_ROTATE_180, "180"},
+      {DRM_MODE_ROTATE_270, "270"}};
+  for (const auto& [b, n] : angles)
+    if ((bits & b) != 0)
+      s += (s.empty() ? "" : ", ") + std::string(n);
+  if ((bits & DRM_MODE_REFLECT_X) != 0)
+    s += ", reflect-x";
+  if ((bits & DRM_MODE_REFLECT_Y) != 0)
+    s += ", reflect-y";
+  return s;
+}
+
+// CARLINKIT_ROTATE = 90|180|270 -> the DRM_MODE_ROTATE_* bit; 0 (none)
+// otherwise.
+uint64_t requested_rotation() {
+  const char* r = std::getenv("CARLINKIT_ROTATE");
+  if (r == nullptr)
+    return 0;
+  if (std::strcmp(r, "90") == 0)
+    return DRM_MODE_ROTATE_90;
+  if (std::strcmp(r, "180") == 0)
+    return DRM_MODE_ROTATE_180;
+  if (std::strcmp(r, "270") == 0)
+    return DRM_MODE_ROTATE_270;
+  return 0;
+}
+
+// Print the connector's available modes and plane rotation support (for
+// --drm-list-modes), so the user can pick a mode and a rotation angle.
 void list_modes(int fd, uint32_t connector_id) {
   drmModeConnector* c = drmModeGetConnector(fd, connector_id);
   if (c == nullptr) {
@@ -97,6 +197,9 @@ void list_modes(int fd, uint32_t connector_id) {
                 m.vrefresh,
                 (m.type & DRM_MODE_TYPE_PREFERRED) != 0 ? "  (preferred)" : "");
   }
+  std::printf(
+      "Rotation (NV12 plane): %s\n",
+      rotation_angles_str(connector_rotation_caps(fd, connector_id)).c_str());
   drmModeFreeConnector(c);
 }
 
@@ -326,6 +429,35 @@ int main(int argc, char** argv) {
                dcfg.fps, dcfg.dpi, dcfg.aaWidth != 0 ? dcfg.aaWidth : vw,
                dcfg.aaHeight != 0 ? dcfg.aaHeight : vh);
 
+  // Optional display rotation (CARLINKIT_ROTATE=90|180|270). We use the HW
+  // plane's rotation property when a candidate NV12 plane advertises the angle;
+  // otherwise drm-cxx would fall back to CPU pre-rotation, which our tiled
+  // DMA-BUF video can't take (and would cripple even if it could) — so we warn
+  // loudly. 90/270 swap the on-screen aspect, handled in the fit below.
+  const uint64_t rot = requested_rotation();
+  const bool swap_wh = rot == DRM_MODE_ROTATE_90 || rot == DRM_MODE_ROTATE_270;
+  if (rot != 0) {
+    const unsigned deg = rot == DRM_MODE_ROTATE_90    ? 90
+                         : rot == DRM_MODE_ROTATE_180 ? 180
+                                                      : 270;
+    if ((connector_rotation_caps(dev.fd(), out->connector_id) & rot) != 0) {
+      std::fprintf(stderr, "rotating video %u degrees on the HW plane\n", deg);
+    } else {
+      std::fprintf(
+          stderr,
+          "\n"
+          "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+          "!!!  SOFTWARE ROTATION WARNING\n"
+          "!!!  No NV12 hardware plane on this output supports %u-degree\n"
+          "!!!  rotation. drm-cxx will fall back to CPU pre-rotation /\n"
+          "!!!  composition, which defeats the zero-copy path, is very\n"
+          "!!!  slow, and may fail outright for the tiled video buffer.\n"
+          "!!!  Prefer an unrotated panel or a plane with rotation support.\n"
+          "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\n",
+          deg);
+    }
+  }
+
   drm::scene::LayerScene::Config cfg;
   cfg.crtc_id = out->crtc_id;
   cfg.connector_id = out->connector_id;
@@ -348,15 +480,20 @@ int main(int argc, char** argv) {
   desc.source = std::move(src);
   // Aspect-preserving fit of the vw x vh video into the W x H display, done by
   // the HW plane scaler (zero CPU). fv* is the final on-screen video rect; it
-  // is reduced to native size below if the plane turns out not to scale.
-  const double fit = std::min(double(W) / vw, double(H) / vh);
-  int fvw = static_cast<int>(std::lround(vw * fit));
-  int fvh = static_cast<int>(std::lround(vh * fit));
+  // is reduced to native size below if the plane turns out not to scale. Under
+  // 90/270 rotation the content is portrait, so fit the swapped dimensions.
+  const uint32_t ivw = swap_wh ? vh : vw;
+  const uint32_t ivh = swap_wh ? vw : vh;
+  const double fit = std::min(double(W) / ivw, double(H) / ivh);
+  int fvw = static_cast<int>(std::lround(ivw * fit));
+  int fvh = static_cast<int>(std::lround(ivh * fit));
   int fvx = (int(W) - fvw) / 2;
   int fvy = (int(H) - fvh) / 2;
   desc.display.src_rect = drm::scene::Rect{0, 0, vw, vh};
   desc.display.dst_rect =
       drm::scene::Rect{fvx, fvy, uint32_t(fvw), uint32_t(fvh)};
+  if (rot != 0)
+    desc.display.rotation = rot;
   desc.content_type = drm::planes::ContentType::Video;
   auto lh = scene->add_layer(std::move(desc));
   if (!lh) {
@@ -472,20 +609,25 @@ int main(int argc, char** argv) {
   const auto sf = vsrc->format();
   const uint32_t aw = sf.width != 0 ? sf.width : vw;
   const uint32_t ah = sf.height != 0 ? sf.height : vh;
-  const double afit = std::min(double(W) / aw, double(H) / ah);
-  fvw = static_cast<int>(std::lround(aw * afit));
-  fvh = static_cast<int>(std::lround(ah * afit));
+  // On-screen content dimensions: 90/270 rotation turns the landscape video
+  // portrait, so fit (and the native fallback) use the swapped extents. The
+  // source rect stays the decoded frame; the plane does the rotation.
+  const uint32_t ew = swap_wh ? ah : aw;
+  const uint32_t eh = swap_wh ? aw : ah;
+  const double afit = std::min(double(W) / ew, double(H) / eh);
+  fvw = static_cast<int>(std::lround(ew * afit));
+  fvh = static_cast<int>(std::lround(eh * afit));
   fvx = (int(W) - fvw) / 2;
   fvy = (int(H) - fvh) / 2;
   auto* layer = scene->get_layer(*lh);
   layer->set_src_rect(drm::scene::Rect{0, 0, aw, ah});
   layer->set_dst_rect(drm::scene::Rect{fvx, fvy, uint32_t(fvw), uint32_t(fvh)});
-  std::fprintf(stderr, "video %ux%u -> dst %dx%d at (%d,%d) on %ux%u\n", aw, ah,
-               fvw, fvh, fvx, fvy, W, H);
+  std::fprintf(stderr, "video %ux%u -> dst %dx%d at (%d,%d) on %ux%u%s\n", aw,
+               ah, fvw, fvh, fvx, fvy, W, H, rot != 0 ? " (rotated)" : "");
   // Probe HW plane scaling; fall back to native size centered if unsupported.
-  if ((fvw != int(aw) || fvh != int(ah)) && !scene->test()) {
-    const int nw = std::min<int>(int(aw), int(W));
-    const int nh = std::min<int>(int(ah), int(H));
+  if ((fvw != int(ew) || fvh != int(eh)) && !scene->test()) {
+    const int nw = std::min<int>(int(ew), int(W));
+    const int nh = std::min<int>(int(eh), int(H));
     fvx = (int(W) - nw) / 2;
     fvy = (int(H) - nh) / 2;
     fvw = nw;
@@ -510,10 +652,14 @@ int main(int argc, char** argv) {
 
   // Touch / pointer input -> dongle touch messages (mapped into the video
   // rect).
-  ck::TouchMapper mapper(int(W), int(H), fvx, fvy, fvw, fvh,
-                         [&](float x, float y, ck::TouchAction a) {
-                           manager.send_touch(x, y, a);
-                         });
+  const int rot_deg = rot == DRM_MODE_ROTATE_90    ? 90
+                      : rot == DRM_MODE_ROTATE_180 ? 180
+                      : rot == DRM_MODE_ROTATE_270 ? 270
+                                                   : 0;
+  ck::TouchMapper mapper(
+      int(W), int(H), fvx, fvy, fvw, fvh,
+      [&](float x, float y, ck::TouchAction a) { manager.send_touch(x, y, a); },
+      rot_deg);
   if (const char* g = std::getenv("CARLINKIT_POINTER_GAIN"); g != nullptr)
     mapper.set_pointer_gain(std::strtod(g, nullptr));
   if (const char* g = std::getenv("CARLINKIT_DRAG_GAIN"); g != nullptr)

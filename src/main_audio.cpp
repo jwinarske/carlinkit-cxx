@@ -11,6 +11,7 @@
 #include <thread>
 
 #include "audio_alsa.h"
+#include "config_env.h"
 #include "dongle.h"
 #include "protocol.h"
 #include "usb_device.h"
@@ -35,7 +36,10 @@ int main(int argc, char** argv) {
   ck::AudioOutput out(play_dev);
   out.start();
 
-  ck::Dongle dongle(*usb);
+  ck::DongleConfig dcfg;
+  ck::apply_box_env(
+      dcfg);  // honor the same CARLINKIT_* overrides as carlinkit-kms
+  ck::Dongle dongle(*usb, dcfg);
   ck::AudioInput mic(cap_dev, [&](const int16_t* pcm, size_t n) {
     dongle.send(ck::send_audio(pcm, n));
   });

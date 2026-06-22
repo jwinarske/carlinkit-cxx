@@ -6,7 +6,11 @@
 // (libavcodec+VAAPI), and scans it out on a KMS plane via drm-cxx.
 //
 // MUST run on a free VT with DRM master (Ctrl+Alt+F3), NOT inside a desktop or
-// over SSH. Usage:  carlinkit-kms [/dev/dri/cardN] [--no-seat]
+// over SSH. Usage:
+//   carlinkit-kms [/dev/dri/cardN] [--no-seat] [--drm-list-modes]
+//                 [--drm-mode N|WxH[@R]]
+// --drm-list-modes prints the connector's modes; --drm-mode selects one (by
+// index or WxH[@R]) and sets resolution/fps/DPI from it.
 #include <poll.h>
 #include <strings.h>
 #include <unistd.h>
@@ -18,6 +22,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -40,6 +45,7 @@
 #include <drm-cxx/input/seat.hpp>
 
 #include "audio_alsa.h"
+#include "config_env.h"
 #include "dongle.h"
 #include "dongle_manager.h"
 #include "input_touch.h"
@@ -49,6 +55,74 @@ namespace {
 std::atomic<bool> g_quit{false};
 void on_sigint(int) {
   g_quit = true;
+}
+
+// DPI from the connector's physical size: round(hdisplay / (mmWidth / 25.4)).
+// Falls back to 160 when the panel reports no physical size. Clamped to a sane
+// range so a bogus EDID can't produce an absurd density.
+uint32_t computed_dpi(int fd, uint32_t connector_id, uint32_t hdisplay) {
+  uint32_t dpi = 160;
+  drmModeConnector* c = drmModeGetConnector(fd, connector_id);
+  if (c != nullptr) {
+    if (c->mmWidth > 0 && hdisplay > 0) {
+      const auto d = static_cast<uint32_t>(
+          std::lround(static_cast<double>(hdisplay) * 25.4 / c->mmWidth));
+      dpi = std::clamp<uint32_t>(d, 72, 480);
+    }
+    drmModeFreeConnector(c);
+  }
+  return dpi;
+}
+
+// Print the connector's available modes (for --drm-list-modes), so the user can
+// pick one to cycle through with --drm-mode.
+void list_modes(int fd, uint32_t connector_id) {
+  drmModeConnector* c = drmModeGetConnector(fd, connector_id);
+  if (c == nullptr) {
+    std::fprintf(stderr, "no connector %u\n", connector_id);
+    return;
+  }
+  char name[64];
+  std::snprintf(name, sizeof name, "%s-%u",
+                drmModeGetConnectorTypeName(c->connector_type),
+                c->connector_type_id);
+  std::printf("Modes for %s (connector %u):\n", name, connector_id);
+  for (int i = 0; i < c->count_modes; ++i) {
+    const drmModeModeInfo& m = c->modes[i];
+    std::printf("  [%2d] %5ux%-5u @ %3uHz%s\n", i, m.hdisplay, m.vdisplay,
+                m.vrefresh,
+                (m.type & DRM_MODE_TYPE_PREFERRED) != 0 ? "  (preferred)" : "");
+  }
+  drmModeFreeConnector(c);
+}
+
+// Resolve --drm-mode: a mode index (from --drm-list-modes) or a "WxH" / "WxH@R"
+// string. The chosen mode drives resolution, fps, and (via the panel) DPI.
+std::optional<drmModeModeInfo> pick_mode(int fd,
+                                         uint32_t connector_id,
+                                         const char* sel) {
+  drmModeConnector* c = drmModeGetConnector(fd, connector_id);
+  if (c == nullptr)
+    return std::nullopt;
+  std::optional<drmModeModeInfo> r;
+  char* end = nullptr;
+  const long idx = std::strtol(sel, &end, 10);
+  if (end != sel && *end == '\0' && idx >= 0 && idx < c->count_modes) {
+    r = c->modes[idx];
+  } else {
+    unsigned w = 0, h = 0, rate = 0;
+    const int n =
+        std::sscanf(sel, "%ux%u@%u", &w, &h, &rate);  // NOLINT(cert-err34-c)
+    if (n >= 2)
+      for (int i = 0; i < c->count_modes; ++i)
+        if (c->modes[i].hdisplay == w && c->modes[i].vdisplay == h &&
+            (n < 3 || c->modes[i].vrefresh == rate)) {
+          r = c->modes[i];
+          break;
+        }
+  }
+  drmModeFreeConnector(c);
+  return r;
 }
 
 // Resolve DRM_FORCE_MODE=WxH to a mode on the connector. We otherwise keep the
@@ -164,7 +238,24 @@ int main(int argc, char** argv) {
   std::signal(SIGINT, on_sigint);
   std::signal(SIGTERM, on_sigint);
 
-  auto out = drm::examples::open_and_pick_output(argc, argv);
+  // Pull our flags out of argv so the drm-cxx output picker doesn't see them.
+  bool list_modes_flag = false;
+  const char* drm_mode_sel = nullptr;
+  std::vector<char*> av{argv[0]};
+  for (int i = 1; i < argc; ++i) {
+    const std::string a = argv[i];
+    if (a == "--drm-list-modes")
+      list_modes_flag = true;
+    else if (a == "--drm-mode" && i + 1 < argc)
+      drm_mode_sel = argv[++i];
+    else if (a.rfind("--drm-mode=", 0) == 0)
+      drm_mode_sel = argv[i] + 11;
+    else
+      av.push_back(argv[i]);
+  }
+
+  auto out = drm::examples::open_and_pick_output(static_cast<int>(av.size()),
+                                                 av.data());
   if (!out) {
     std::fprintf(
         stderr,
@@ -187,20 +278,48 @@ int main(int argc, char** argv) {
   }
   if (const char* cr = std::getenv("CARLINKIT_CRTC"); cr != nullptr)
     out->crtc_id = static_cast<uint32_t>(std::strtoul(cr, nullptr, 0));
+  // --drm-list-modes: print the chosen connector's modes and exit.
+  if (list_modes_flag) {
+    list_modes(dev.fd(), out->connector_id);
+    return 0;
+  }
   // Keep the panel's native (preferred) mode unless explicitly overridden — a
   // non-native mode makes the monitor rescale and distort aspect.
   if (auto m = forced_mode(dev.fd(), out->connector_id,
                            std::getenv("DRM_FORCE_MODE"));
       m)
     out->mode = *m;
+  // --drm-mode (index or WxH[@R]) takes precedence; it sets resolution, fps,
+  // and DPI together via the derivation below. Useful for cycling modes by eye.
+  if (drm_mode_sel != nullptr) {
+    if (auto m = pick_mode(dev.fd(), out->connector_id, drm_mode_sel); m) {
+      out->mode = *m;
+    } else {
+      std::fprintf(stderr, "--drm-mode '%s' not found; try --drm-list-modes\n",
+                   drm_mode_sel);
+      return 1;
+    }
+  }
   std::fprintf(stderr, "connector=%u crtc=%u\n", out->connector_id,
                out->crtc_id);
   const uint32_t W = out->mode.hdisplay, H = out->mode.vdisplay;
   std::fprintf(stderr, "display %ux%u@%uHz\n", W, H, out->mode.vrefresh);
 
-  // CarPlay renders at this (landscape) size; the HW plane scales it to fit the
-  // panel below while preserving aspect ratio.
-  const uint32_t vw = 1280, vh = 720;
+  // Projection resolution defaults to the DRM mode (1:1, no scaling); fps from
+  // the mode's refresh (capped); DPI from the panel's physical size. Each is
+  // overridable via CARLINKIT_* (see config_env.h / README), as are the box
+  // settings (Android Auto canvas, drive position, GNSS/dashboard/BT, …).
+  ck::DongleConfig dcfg;
+  dcfg.width = W;
+  dcfg.height = H;
+  dcfg.fps =
+      std::min<uint32_t>(out->mode.vrefresh != 0 ? out->mode.vrefresh : 60, 60);
+  dcfg.dpi = computed_dpi(dev.fd(), out->connector_id, W);
+  ck::apply_box_env(dcfg);
+  const uint32_t vw = dcfg.width, vh = dcfg.height;
+  std::fprintf(stderr, "requesting %ux%u@%ufps dpi=%u (AA %ux%u)\n", vw, vh,
+               dcfg.fps, dcfg.dpi, dcfg.aaWidth != 0 ? dcfg.aaWidth : vw,
+               dcfg.aaHeight != 0 ? dcfg.aaHeight : vh);
 
   drm::scene::LayerScene::Config cfg;
   cfg.crtc_id = out->crtc_id;
@@ -241,11 +360,6 @@ int main(int argc, char** argv) {
   }
   auto* vsrc =
       dynamic_cast<ck::VaapiDecoderSource*>(&scene->get_layer(*lh)->source());
-
-  ck::DongleConfig dcfg;
-  dcfg.width = vw;
-  dcfg.height = vh;
-  dcfg.fps = 30;
 
   // Audio: ALSA playback of the dongle PCM + on-demand mic capture. Devices are
   // overridable (e.g. CARLINKIT_AUDIO_DEV=plughw:1,3 for HDMI/monitor speakers

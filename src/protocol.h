@@ -131,8 +131,15 @@ struct DongleConfig {
   uint32_t iBoxVersion = 2;
   uint32_t packetMax = 49152;
   uint32_t phoneWorkMode = 2;
-  uint32_t hand = 0;  // 0=LHD 1=RHD
+  uint32_t hand = 0;  // drivePosition: 0=LHD 1=RHD
   uint32_t mediaDelay = 300;
+  uint32_t aaWidth = 0;   // Android Auto canvas; 0 => use width/height
+  uint32_t aaHeight = 0;  // Android Auto canvas; 0 => use width/height
+  uint32_t gnssCapability =
+      0;                       // 0 = none; advertise only with a real GNSS feed
+  uint32_t dashboardInfo = 1;  // 1 = offer the CarPlay Dashboard
+  uint32_t useBtPhone = 0;     // 0 = calls over the projection link
+  uint32_t hiCarConnectMode = 0;
   bool nightMode = false;
   bool audioTransferMode = false;
   bool wifi5g = true;
@@ -260,12 +267,22 @@ inline std::vector<uint8_t> send_open(const DongleConfig& c) {
   return frame(MessageType::Open, p);
 }
 // BoxSettings: ASCII JSON payload. syncTime is epoch-ms supplied by caller.
+// Android Auto canvas falls back to the box resolution when aaWidth/aaHeight
+// are unset. Feature flags carry conservative defaults (see DongleConfig).
 inline std::vector<uint8_t> send_box_settings(const DongleConfig& c,
                                               uint64_t syncTimeMs) {
-  std::string json = "{\"mediaDelay\":" + std::to_string(c.mediaDelay) +
-                     ",\"syncTime\":" + std::to_string(syncTimeMs) +
-                     ",\"androidAutoSizeW\":" + std::to_string(c.width) +
-                     ",\"androidAutoSizeH\":" + std::to_string(c.height) + "}";
+  const uint32_t aaW = c.aaWidth != 0 ? c.aaWidth : c.width;
+  const uint32_t aaH = c.aaHeight != 0 ? c.aaHeight : c.height;
+  std::string json =
+      "{\"mediaDelay\":" + std::to_string(c.mediaDelay) +
+      ",\"syncTime\":" + std::to_string(syncTimeMs) +
+      ",\"androidAutoSizeW\":" + std::to_string(aaW) +
+      ",\"androidAutoSizeH\":" + std::to_string(aaH) +
+      ",\"drivePosition\":" + std::to_string(c.hand) +
+      ",\"HiCarConnectMode\":" + std::to_string(c.hiCarConnectMode) +
+      ",\"GNSSCapability\":" + std::to_string(c.gnssCapability) +
+      ",\"DashboardInfo\":" + std::to_string(c.dashboardInfo) +
+      ",\"UseBTPhone\":" + std::to_string(c.useBtPhone) + "}";
   std::vector<uint8_t> p(json.begin(), json.end());
   return frame(MessageType::BoxSettings, p);
 }
@@ -288,8 +305,8 @@ inline std::vector<uint8_t> send_audio(const int16_t* pcm, size_t samples) {
 // Single-touch. x,y are normalized [0,1]; encoded as fixed-point 0..10000.
 inline std::vector<uint8_t> send_touch(float x, float y, TouchAction action) {
   auto clamp01 = [](float v) { return v < 0 ? 0.f : (v > 1 ? 1.f : v); };
-  uint32_t fx = static_cast<uint32_t>(clamp01(x) * 10000.f);
-  uint32_t fy = static_cast<uint32_t>(clamp01(y) * 10000.f);
+  const auto fx = static_cast<uint32_t>(clamp01(x) * 10000.f);
+  const auto fy = static_cast<uint32_t>(clamp01(y) * 10000.f);
   std::vector<uint8_t> p;
   put_u32(p, static_cast<uint32_t>(action));
   put_u32(p, fx);

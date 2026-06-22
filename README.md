@@ -109,6 +109,11 @@ your display manager first if needed: `sudo systemctl stop gdm`).
 ```bash
 ./build/carlinkit-kms /dev/dri/card1 --no-seat
 # Pair your iPhone (Wi-Fi + Bluetooth on). Quit with Esc / Q / Ctrl-C.
+
+# Inspect / pick a display mode (sets resolution, fps, and DPI together):
+./build/carlinkit-kms /dev/dri/card1 --no-seat --drm-list-modes
+./build/carlinkit-kms /dev/dri/card1 --no-seat --drm-mode 9        # by index
+./build/carlinkit-kms /dev/dri/card1 --no-seat --drm-mode 1280x720 # or WxH[@R]
 ```
 
 - **Video** fills the panel preserving aspect ratio via the HW plane scaler (zero
@@ -127,6 +132,16 @@ Environment overrides:
 | `CARLINKIT_CONNECTOR=DP-1` | Target a specific display (e.g. `HDMI-A-1`, `DP-1`) |
 | `DRM_FORCE_MODE=2560x1440` | Force a specific mode on the connector |
 | `CARLINKIT_CRTC=<id>` | Force a CRTC (debug; see `carlinkit-drm-dump`) |
+| `CARLINKIT_RESOLUTION=1280x720` | CarPlay/box resolution; default = the DRM mode (1:1, no scaling) |
+| `CARLINKIT_AA_RESOLUTION=1280x720` | Android Auto canvas; default = the box resolution |
+| `CARLINKIT_FPS=60` | Frame rate; default = the mode's refresh rate, capped at 60 |
+| `CARLINKIT_DPI=160` | UI density; default computed from the panel's physical size, else 160 |
+| `CARLINKIT_DRIVE_POSITION=left` | `left`/`right` (LHD/RHD); default `left` |
+| `CARLINKIT_MEDIA_DELAY=300` | Audio/video sync compensation in ms (default 300) |
+| `CARLINKIT_GNSS=0` | `GNSSCapability` bitmask advertised to the phone (default 0 = none; only set with a real GNSS feed) |
+| `CARLINKIT_DASHBOARD=1` | `DashboardInfo`: offer the CarPlay Dashboard (default 1) |
+| `CARLINKIT_BT_PHONE=0` | `UseBTPhone`: 1 routes calls via the car's Bluetooth instead of this link (default 0) |
+| `CARLINKIT_HICAR=0` | `HiCarConnectMode` for Huawei HiCar (default 0) |
 | `CARLINKIT_POINTER_GAIN=4` | Free mouse cursor speed multiplier (default 2.5) |
 | `CARLINKIT_DRAG_GAIN=5` | Cursor speed while a button is held — swipes/flings (default 5.0) |
 | `CARLINKIT_TOUCH_HZ=90` | Touch report rate while dragging; coalesces the mouse stream to a touchscreen-like rate so CarPlay flings register (default 90) |

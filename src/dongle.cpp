@@ -206,10 +206,31 @@ void Dongle::dispatch(const Header& h, const uint8_t* p, size_t len) const {
         af.command =
             static_cast<int>(p[12]);  // AudioCommand 1..13 (unsigned byte)
       } else if (rest == 4) {
-        // volume-duration float; no PCM
+        af.volumeDuration =
+            get_f32(p + 12);  // duck: ramp to `volume` over this
+        af.hasVolumeDuration = true;
       } else if (rest >= 2) {
         af.pcm = reinterpret_cast<const int16_t*>(p + 12);
         af.samples = rest / 2;
+      }
+      // CARLINKIT_AUDIO_TRACE=1: log every AudioData with a timestamp so we can
+      // see whether distinct (decodeType,audioType) streams overlap in time
+      // (concurrent → mixing needed) or are serialized (gain-ramp ducking
+      // only).
+      static const bool atrace =
+          std::getenv("CARLINKIT_AUDIO_TRACE") != nullptr;
+      if (atrace) {
+        const auto t = static_cast<unsigned long long>(now_ms());
+        if (rest == 1)
+          std::fprintf(stderr, "[atrace] t=%llu dt=%u at=%u cmd=%d\n", t,
+                       af.decodeType, af.audioType, af.command);
+        else if (rest == 4)
+          std::fprintf(stderr,
+                       "[atrace] t=%llu dt=%u at=%u dur=%.3fs vol=%.3f\n", t,
+                       af.decodeType, af.audioType, get_f32(p + 12), af.volume);
+        else
+          std::fprintf(stderr, "[atrace] t=%llu dt=%u at=%u pcm=%zu vol=%.3f\n",
+                       t, af.decodeType, af.audioType, af.samples, af.volume);
       }
       if (sink_.on_audio)
         sink_.on_audio(af);

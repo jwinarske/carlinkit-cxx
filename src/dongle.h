@@ -25,12 +25,14 @@ struct VideoFrame {
 };
 
 struct AudioFrame {
-  uint32_t decodeType;
-  float volume;
-  uint32_t audioType;
-  const int16_t* pcm;
-  size_t samples;
-  int command;  // >=0 when this is an AudioCommand control frame, else -1
+  uint32_t decodeType = 0;
+  float volume = 0.0F;
+  uint32_t audioType = 0;
+  const int16_t* pcm = nullptr;
+  size_t samples = 0;
+  int command = -1;  // >=0 for an AudioCommand control frame, else -1
+  float volumeDuration = 0.0F;     // gain-ramp seconds when hasVolumeDuration
+  bool hasVolumeDuration = false;  // duck: ramp this stream to `volume`
 };
 
 struct DongleSink {

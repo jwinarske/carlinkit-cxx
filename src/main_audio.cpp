@@ -33,7 +33,7 @@ int main(int argc, char** argv) {
   if (!usb || !usb->claim())
     return 1;
 
-  ck::AudioOutput out(play_dev);
+  ck::AudioMixer out(play_dev);
   out.start();
 
   ck::DongleConfig dcfg;
@@ -48,8 +48,8 @@ int main(int argc, char** argv) {
   uint32_t a_frames = 0;
   ck::DongleSink sink;
   sink.on_audio = [&](const ck::AudioFrame& f) {
+    out.submit(f);  // PCM mixing + ducking handled by the mixer
     if (f.pcm) {
-      out.submit(f.decodeType, f.pcm, f.samples);
       a_samples += f.samples;
       if (++a_frames % 50 == 0)
         std::fprintf(stderr, "[audio] type=%u %llu samples played\n",

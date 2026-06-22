@@ -16,6 +16,8 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <iterator>
 #include <thread>
 #include <vector>
 
@@ -287,6 +289,15 @@ int main(int argc, char** argv) {
   sink.on_plugged = [&](ck::PhoneType t, bool wifi) {
     std::fprintf(stderr, "[plugged] type=%d wifi=%d\n", int(t), wifi);
   };
+  // The CarPlay "car logo" button (return to the vehicle's own UI) arrives as a
+  // RequestHostUI command. This receiver has no separate host UI, so log it and
+  // exit cleanly.
+  sink.on_command = [&](ck::Command c) {
+    if (c == ck::Command::RequestHostUI) {
+      std::fprintf(stderr, "[command] RequestHostUI (car logo) — exiting\n");
+      g_quit = true;
+    }
+  };
 
   // Hotplug supervisor: connects/reconnects the dongle automatically and
   // survives surprise removal (the panel keeps the last frame until video
@@ -296,6 +307,27 @@ int main(int argc, char** argv) {
   manager.set_on_disconnected([] {
     std::fprintf(stderr, "[dongle] disconnected — waiting for reconnect\n");
   });
+  // Optional OEM branding: CARLINKIT_OEM_ICON=<path-to-png> sets the dongle's
+  // own launcher tile (CARLINKIT_OEM_LABEL is the optional caption). Pushed on
+  // each connect, before the phone pairs.
+  const char* oem_icon = std::getenv("CARLINKIT_OEM_ICON");
+  const char* oem_label = std::getenv("CARLINKIT_OEM_LABEL");
+  if (oem_icon != nullptr) {
+    manager.set_on_connected([oem_icon, oem_label, &manager] {
+      std::ifstream f(oem_icon, std::ios::binary);
+      std::vector<uint8_t> png((std::istreambuf_iterator<char>(f)),
+                               std::istreambuf_iterator<char>());
+      if (png.empty()) {
+        std::fprintf(stderr, "[oem-icon] could not read %s\n", oem_icon);
+        return;
+      }
+      for (auto& frame : ck::send_oem_icon(
+               png.data(), png.size(), oem_label != nullptr ? oem_label : ""))
+        manager.send(std::move(frame));
+      std::fprintf(stderr, "[oem-icon] sent %s (%zu bytes)\n", oem_icon,
+                   png.size());
+    });
+  }
   std::fprintf(stderr, "waiting for dongle + phone (wifi+BT on, nearby)...\n");
   manager.start();
 

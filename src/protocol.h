@@ -114,6 +114,12 @@ constexpr const char* kHandDrive = "/tmp/hand_drive_mode";
 constexpr const char* kChargeMode = "/tmp/charge_mode";
 constexpr const char* kBoxName = "/etc/box_name";
 constexpr const char* kAndroidWorkMode = "/etc/android_work_mode";
+// OEM launcher icon/label for the dongle's own tile (see send_oem_icon).
+constexpr const char* kAirplayConf = "/etc/airplay.conf";
+constexpr const char* kOemIcon = "/etc/oem_icon.png";
+constexpr const char* kIcon120 = "/etc/icon_120x120.png";
+constexpr const char* kIcon180 = "/etc/icon_180x180.png";
+constexpr const char* kIcon256 = "/etc/icon_256x256.png";
 }  // namespace file
 
 struct DongleConfig {
@@ -212,6 +218,31 @@ inline std::vector<uint8_t> send_string(const char* path,
                                         const std::string& s) {
   return send_file(path, reinterpret_cast<const uint8_t*>(s.data()), s.size());
 }
+
+// Set the dongle's OEM launcher icon and label (the tile the box presents as a
+// CarPlay accessory — not the in-CarPlay "My Car" button, which iOS renders).
+// `png`/`len` is a PNG image; `label` (optional) is the text under the icon.
+// Returns the wire frames to send in order: the airplay.conf that enables the
+// icon, then the image written to each path the dongle reads.
+inline std::vector<std::vector<uint8_t>> send_oem_icon(
+    const uint8_t* png,
+    size_t len,
+    const std::string& label = "",
+    const std::string& name = "AutoBox",
+    const std::string& model = "Magic-Car-Link-1.00") {
+  std::vector<std::vector<uint8_t>> msgs;
+  std::string conf = "oemIconVisible = 1\nname = " + name +
+                     "\nmodel = " + model +
+                     "\noemIconPath = " + file::kOemIcon + "\n";
+  if (!label.empty())
+    conf += "oemIconLabel = " + label + "\n";
+  msgs.push_back(send_string(file::kAirplayConf, conf));
+  for (const char* path :
+       {file::kOemIcon, file::kIcon120, file::kIcon180, file::kIcon256})
+    msgs.push_back(send_file(path, png, len));
+  return msgs;
+}
+
 inline std::vector<uint8_t> send_command(Command c) {
   std::vector<uint8_t> p;
   put_u32(p, static_cast<uint32_t>(c));

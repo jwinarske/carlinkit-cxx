@@ -133,6 +133,8 @@ Environment overrides:
 | `CARLINKIT_AUDIO_DEV=plughw:1,3` | ALSA playback device (default `default`) — see Audio setup |
 | `CARLINKIT_AUDIO_LATENCY_MS=120` | Playback buffer in ms; larger trades latency for fewer underrun clicks (default 120) |
 | `CARLINKIT_MIC_DEV=plughw:2,0` | ALSA capture device for Siri / calls (default `default`) |
+| `CARLINKIT_OEM_ICON=assets/logo.png` | PNG to set as the dongle's own launcher tile (sent on connect); unset = leave the dongle's default |
+| `CARLINKIT_OEM_LABEL="carlinkit-cxx"` | Optional caption shown under the OEM icon |
 
 > **Known issue:** on some AMD multi-display setups, drm-cxx's allocator rejects
 > the decoder's tiled-NV12 modifier on one pipe (e.g. `DP-1`) even though the

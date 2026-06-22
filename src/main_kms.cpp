@@ -371,7 +371,7 @@ int main(int argc, char** argv) {
   // when PipeWire isn't routing "default").
   const char* audio_dev = std::getenv("CARLINKIT_AUDIO_DEV");
   const char* mic_dev = std::getenv("CARLINKIT_MIC_DEV");
-  ck::AudioOutput audio_out(audio_dev != nullptr ? audio_dev : "default");
+  ck::AudioMixer audio_out(audio_dev != nullptr ? audio_dev : "default");
   audio_out.start();
   // `mgr` is set right after the manager is constructed; the mic callback
   // captures it to break the sink <-> mic <-> manager construction cycle.
@@ -387,9 +387,8 @@ int main(int argc, char** argv) {
     vsrc->submit_bitstream(f.data, f.size);
   };
   sink.on_audio = [&](const ck::AudioFrame& f) {
-    if (f.pcm) {
-      audio_out.submit(f.decodeType, f.pcm, f.samples);
-    } else if (f.command >= 0) {
+    audio_out.submit(f);  // PCM mixing + ducking handled by the mixer
+    if (f.command >= 0) {
       switch (static_cast<ck::AudioCommand>(f.command)) {
         case ck::AudioCommand::InputConfig:
         case ck::AudioCommand::PhonecallStart:

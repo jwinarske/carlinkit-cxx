@@ -4,9 +4,13 @@
 
 #include <alsa/asoundlib.h>
 
+#include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+
+#include "dongle.h"  // AudioFrame
 
 namespace ck {
 
@@ -62,8 +66,8 @@ PcmFormat decode_type_format(uint32_t decode_type) {
   }
 }
 
-// ── AudioOutput ─────────────────────────────────────────────────────────────
-AudioOutput::AudioOutput(const char* device) : device_(device) {
+// ── AudioMixer ──────────────────────────────────────────────────────────────
+AudioMixer::AudioMixer(const char* device) : device_(device) {
   if (const char* e = std::getenv("CARLINKIT_AUDIO_LATENCY_MS"); e != nullptr) {
     const auto ms = static_cast<unsigned>(std::strtoul(e, nullptr, 10));
     if (ms >= 20 && ms <= 1000)
@@ -71,53 +75,72 @@ AudioOutput::AudioOutput(const char* device) : device_(device) {
   }
 }
 
-AudioOutput::~AudioOutput() {
+AudioMixer::~AudioMixer() {
   stop();
 }
 
-void AudioOutput::start() {
+void AudioMixer::start() {
   if (running_.exchange(true))
     return;
   thread_ = std::thread([this] { run(); });
 }
 
-void AudioOutput::stop() {
+void AudioMixer::stop() {
   if (!running_.exchange(false))
     return;
   cv_.notify_all();
   if (thread_.joinable())
     thread_.join();
-  if (pcm_) {
+  if (pcm_ != nullptr) {
     snd_pcm_close(pcm_);
     pcm_ = nullptr;
   }
 }
 
-void AudioOutput::submit(uint32_t decode_type,
-                         const int16_t* pcm,
-                         size_t samples) {
-  if (!running_ || samples == 0)
+AudioMixer::Lane& AudioMixer::lane_for(uint32_t decode_type,
+                                       uint32_t audio_type) {
+  const uint64_t key = (static_cast<uint64_t>(decode_type) << 32) | audio_type;
+  if (auto it = lanes_.find(key); it != lanes_.end())
+    return it->second;
+  const PcmFormat fmt = decode_type_format(decode_type);
+  Lane l;
+  l.rate = fmt.rate;
+  l.channels = fmt.channels;
+  return lanes_.emplace(key, std::move(l)).first->second;
+}
+
+void AudioMixer::submit(const AudioFrame& f) {
+  if (!running_)
     return;
-  Chunk c;
-  c.decode_type = decode_type;
-  c.pcm.assign(pcm, pcm + samples);
-  {
-    std::lock_guard<std::mutex> lk(m_);
-    if (q_.size() > 64)  // bound latency on a slow/stalled sink
-      q_.pop_front();
-    q_.push_back(std::move(c));
+  std::lock_guard<std::mutex> lk(m_);
+  Lane& l = lane_for(f.decodeType, f.audioType);
+  l.last = std::chrono::steady_clock::now();
+  if (f.hasVolumeDuration) {
+    // Duck: ramp this lane's gain toward `volume` over `volumeDuration`
+    // seconds.
+    const double target =
+        f.volume < 0.0F ? 0.0 : (f.volume > 1.0F ? 1.0 : f.volume);
+    const double secs = f.volumeDuration > 0.0F ? f.volumeDuration : 0.02;
+    l.target = target;
+    l.step = (l.target - l.gain) / std::max(1.0, secs * l.rate);
+  } else if (f.pcm != nullptr && f.samples != 0) {
+    l.ring.insert(l.ring.end(), f.pcm, f.pcm + f.samples);
+    const size_t cap = static_cast<size_t>(l.rate) * l.channels;  // ~1s backlog
+    if (l.ring.size() > cap) {  // safety: drop oldest, keep pos consistent
+      const size_t drop = l.ring.size() - cap;
+      l.ring.erase(l.ring.begin(), l.ring.begin() + static_cast<long>(drop));
+      const size_t drop_frames = drop / l.channels;
+      const auto df = static_cast<double>(drop_frames);
+      l.pos = l.pos > df ? l.pos - df : 0.0;
+    }
   }
   cv_.notify_one();
 }
 
-bool AudioOutput::ensure_params(uint32_t decode_type) {
-  const PcmFormat want = decode_type_format(decode_type);
-  // Only reopen on a real rate/channel change. CarPlay alternates decodeTypes
-  // that map to the same shape (e.g. 1 and 2 are both 44100/2); reopening for
-  // those would click on HDMI for no reason.
-  if (pcm_ && want.rate == cur_rate_ && want.channels == cur_channels_)
+bool AudioMixer::ensure_params(unsigned rate, unsigned channels) {
+  if (pcm_ != nullptr && rate == cur_rate_ && channels == cur_channels_)
     return true;
-  if (pcm_) {  // genuine format change — drain what's buffered, then reopen
+  if (pcm_ != nullptr) {  // format change — drain, then reopen
     snd_pcm_drain(pcm_);
     snd_pcm_close(pcm_);
     pcm_ = nullptr;
@@ -130,45 +153,117 @@ bool AudioOutput::ensure_params(uint32_t decode_type) {
     return false;
   }
   if (int r = snd_pcm_set_params(pcm_, SND_PCM_FORMAT_S16_LE,
-                                 SND_PCM_ACCESS_RW_INTERLEAVED, want.channels,
-                                 want.rate, 1 /*resample*/, latency_us_);
+                                 SND_PCM_ACCESS_RW_INTERLEAVED, channels, rate,
+                                 1 /*resample*/, latency_us_);
       r < 0) {
-    std::fprintf(stderr, "alsa: set_params(%uHz/%uch) failed: %s\n", want.rate,
-                 want.channels, snd_strerror(r));
+    std::fprintf(stderr, "alsa: set_params(%uHz/%uch) failed: %s\n", rate,
+                 channels, snd_strerror(r));
     snd_pcm_close(pcm_);
     pcm_ = nullptr;
     return false;
   }
-  unmute_pcm_card(pcm_);  // clear a muted mixer so playback is actually audible
-  cur_rate_ = want.rate;
-  cur_channels_ = want.channels;
+  unmute_pcm_card(pcm_);
+  cur_rate_ = rate;
+  cur_channels_ = channels;
   return true;
 }
 
-void AudioOutput::run() {
+void AudioMixer::mix_lane(Lane& l, std::vector<int32_t>& acc, int block) const {
+  const double ratio = static_cast<double>(l.rate) / out_rate_;  // src/out
+  const size_t avail = l.ring.size() / l.channels;  // available source frames
+  for (int i = 0; i < block; ++i) {
+    l.gain += l.step;  // advance the gain envelope once per output frame
+    if ((l.step > 0 && l.gain > l.target) || (l.step < 0 && l.gain < l.target))
+      l.gain = l.target;
+    const auto i0 = static_cast<size_t>(l.pos);
+    if (i0 >= avail)
+      break;  // out of source data — silence for the rest of the block
+    const size_t i1 = (i0 + 1 < avail) ? i0 + 1 : i0;  // clamp at the tail
+    const double frac = l.pos - static_cast<double>(i0);
+    const size_t o = static_cast<size_t>(i) * out_channels_;
+    if (l.channels == 1) {
+      const double s = (l.ring[i0] * (1.0 - frac) + l.ring[i1] * frac) * l.gain;
+      const auto v = static_cast<int32_t>(std::lround(s));
+      acc[o] += v;
+      acc[o + 1] += v;  // mono upmixed to stereo
+    } else {            // stereo
+      const double sl =
+          (l.ring[i0 * 2] * (1.0 - frac) + l.ring[i1 * 2] * frac) * l.gain;
+      const double sr =
+          (l.ring[i0 * 2 + 1] * (1.0 - frac) + l.ring[i1 * 2 + 1] * frac) *
+          l.gain;
+      acc[o] += static_cast<int32_t>(std::lround(sl));
+      acc[o + 1] += static_cast<int32_t>(std::lround(sr));
+    }
+    l.pos += ratio;
+  }
+  // Drop the source frames we advanced past; keep the fractional remainder.
+  const size_t consumed = std::min(static_cast<size_t>(l.pos), avail);
+  if (consumed > 0) {
+    l.ring.erase(l.ring.begin(),
+                 l.ring.begin() + static_cast<long>(consumed * l.channels));
+    l.pos -= static_cast<double>(consumed);
+  }
+}
+
+void AudioMixer::run() {
+  const int block = static_cast<int>(out_rate_ / 100);  // 10 ms
+  std::vector<int32_t> acc;
+  std::vector<int16_t> out;
+  auto last_audio = std::chrono::steady_clock::now() - std::chrono::hours(1);
   while (running_) {
-    Chunk c;
     {
       std::unique_lock<std::mutex> lk(m_);
-      cv_.wait(lk, [this] { return !running_ || !q_.empty(); });
-      if (!running_)
-        break;
-      c = std::move(q_.front());
-      q_.pop_front();
-    }
-    if (!ensure_params(c.decode_type))
+      const auto now = std::chrono::steady_clock::now();
+      // Drop lanes with no audio for a while so stale ones don't linger.
+      for (auto it = lanes_.begin(); it != lanes_.end();) {
+        if (it->second.ring.empty() &&
+            now - it->second.last > std::chrono::seconds(3))
+          it = lanes_.erase(it);
+        else
+          ++it;
+      }
+      const bool data =
+          std::any_of(lanes_.begin(), lanes_.end(),
+                      [](const auto& kv) { return !kv.second.ring.empty(); });
+      if (data)
+        last_audio = now;
+      // Keep the device running through brief gaps between streams (e.g. music
+      // stopping while Siri "thinks") by writing silence, so the next stream
+      // doesn't restart the PCM and click. Only go idle after a longer silence.
+      constexpr auto kKeepAlive = std::chrono::milliseconds(4000);
+      if (!data && now - last_audio > kKeepAlive) {  // truly idle — wait
+        cv_.wait_for(lk, std::chrono::milliseconds(50), [this] {
+          return !running_ ||
+                 std::any_of(lanes_.begin(), lanes_.end(), [](const auto& kv) {
+                   return !kv.second.ring.empty();
+                 });
+        });
+        continue;
+      }
+      // Mix every lane into the fixed-rate output (silence if a lane is empty),
+      // resampled as needed. The device never reconfigures, so stream
+      // boundaries don't click.
+      acc.assign(static_cast<size_t>(block) * out_channels_, 0);
+      for (auto& kv : lanes_)
+        mix_lane(kv.second, acc, block);
+    }  // release the lock before the blocking ALSA write
+
+    if (!ensure_params(out_rate_, out_channels_))
       continue;
-    const unsigned ch = decode_type_format(c.decode_type).channels;
-    const int16_t* p = c.pcm.data();
-    snd_pcm_uframes_t frames = c.pcm.size() / ch;
+    out.resize(acc.size());
+    for (size_t i = 0; i < acc.size(); ++i) {
+      const int32_t v = acc[i];
+      out[i] =
+          static_cast<int16_t>(v < -32768 ? -32768 : (v > 32767 ? 32767 : v));
+    }
+    const int16_t* p = out.data();
+    auto frames = static_cast<snd_pcm_uframes_t>(block);
     while (frames > 0 && running_) {
       snd_pcm_sframes_t n = snd_pcm_writei(pcm_, p, frames);
       if (n < 0) {
         if (n == -EPIPE && (xruns_++ % 50) == 0)
-          std::fprintf(stderr,
-                       "alsa: playback underrun (xrun #%d) — audible click; a "
-                       "larger buffer helps if frequent\n",
-                       xruns_);
+          std::fprintf(stderr, "alsa: playback underrun (xrun #%d)\n", xruns_);
         n = snd_pcm_recover(pcm_, static_cast<int>(n), 1);
         if (n < 0) {
           std::fprintf(stderr, "alsa: writei: %s\n",
@@ -177,7 +272,7 @@ void AudioOutput::run() {
         }
         continue;
       }
-      p += static_cast<size_t>(n) * ch;
+      p += static_cast<size_t>(n) * out_channels_;
       frames -= static_cast<snd_pcm_uframes_t>(n);
     }
   }

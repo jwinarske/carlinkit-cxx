@@ -5,6 +5,7 @@
 // on-demand microphone capture (for Siri / phone calls) sent back to the
 // dongle.
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -13,12 +14,15 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 // NOLINTNEXTLINE(bugprone-reserved-identifier) — ALSA's own opaque type name.
 typedef struct _snd_pcm snd_pcm_t;
 
 namespace ck {
+
+struct AudioFrame;  // dongle.h
 
 // PCM shape for a dongle AudioData decodeType (all S16LE). See node-CarPlay
 // decodeTypeMap.
@@ -28,44 +32,64 @@ struct PcmFormat {
 };
 PcmFormat decode_type_format(uint32_t decode_type);
 
-// Playback. PCM is queued from the dongle RX thread and written by a dedicated
-// thread so ALSA backpressure never stalls USB reception. Reconfigures the PCM
-// device when the stream's rate/channels change.
-class AudioOutput {
+// Mixing playback. The dongle keys audio by (decodeType, audioType): concurrent
+// same-format streams (e.g. music ducked under a navigation prompt) are summed
+// with per-stream gain, and a volumeDuration frame ramps a stream's gain (the
+// duck). A different-format stream (e.g. Siri, which the dongle serializes by
+// stopping music) becomes the active format and triggers a device reconfigure —
+// no resampling, because concurrent streams always share a format. PCM is fed
+// from the dongle RX thread; a dedicated thread mixes and writes so ALSA
+// backpressure never stalls USB reception.
+class AudioMixer {
  public:
-  explicit AudioOutput(const char* device = "default");
-  ~AudioOutput();
+  explicit AudioMixer(const char* device = "default");
+  ~AudioMixer();
 
   void start();
   void stop();
 
-  // Queue S16LE samples (count is total int16s, i.e. frames * channels).
-  void submit(uint32_t decode_type, const int16_t* pcm, size_t samples);
+  // Route a decoded AudioData frame: PCM is appended to its lane; a
+  // volumeDuration frame ramps its lane's gain. Commands are ignored here.
+  void submit(const AudioFrame& f);
 
  private:
   void run();
-  bool ensure_params(uint32_t decode_type);
+  bool ensure_params(unsigned rate, unsigned channels);
 
-  struct Chunk {
-    uint32_t decode_type;
-    std::vector<int16_t> pcm;
+  // One audio stream: native-format S16 ring + a gain envelope.
+  struct Lane {
+    unsigned rate = 0;
+    unsigned channels = 0;
+    std::deque<int16_t> ring;
+    double gain = 1.0;
+    double target = 1.0;
+    double step = 0.0;  // per-output-frame gain increment toward target
+    double pos = 0.0;   // fractional source-frame read position (resampling)
+    std::chrono::steady_clock::time_point last{};
   };
+  Lane& lane_for(uint32_t decode_type, uint32_t audio_type);  // holds m_
+  // Linear-resample `block` output frames from a lane into the mix accumulator
+  // (mono upmixed to stereo), applying the lane's gain. Holds m_.
+  void mix_lane(Lane& l, std::vector<int32_t>& acc, int block) const;
 
   std::string device_;
   snd_pcm_t* pcm_ = nullptr;
-  // The PCM's currently-configured shape. Reconfigure (which clicks on HDMI) is
-  // driven by these, not the raw decodeType, so equivalent types don't reopen.
+  // Fixed output format: the device opens once and never reconfigures, so a
+  // different-rate stream (e.g. Siri 16000/1) is resampled in rather than
+  // forcing a device reconfigure (which clicks at the stream boundaries). 44100
+  // is the media rate, so music/navigation pass through untouched.
+  unsigned out_rate_ = 44100;
+  unsigned out_channels_ = 2;
   unsigned cur_rate_ = 0;
   unsigned cur_channels_ = 0;
-  // Target buffer latency; larger absorbs more USB/scheduling jitter (fewer
-  // underrun clicks) at the cost of audio delay. Override via env at
-  // construction.
+  // Target buffer latency; larger absorbs more jitter at the cost of delay.
   unsigned latency_us_ = 120000;
   int xruns_ = 0;  // playback-thread underrun count (diagnostic)
 
   std::mutex m_;
   std::condition_variable cv_;
-  std::deque<Chunk> q_;
+  std::unordered_map<uint64_t, Lane>
+      lanes_;  // key = decodeType<<32 | audioType
   std::thread thread_;
   std::atomic<bool> running_{false};
 };

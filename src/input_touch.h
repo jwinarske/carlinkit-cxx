@@ -27,7 +27,17 @@ class TouchMapper {
  public:
   using SendFn = std::function<void(float x, float y, TouchAction action)>;
 
-  TouchMapper(int dw, int dh, int vx, int vy, int vw, int vh, SendFn send)
+  // rot_deg is the display rotation (0/90/180/270). The video rect
+  // (vx,vy,vw,vh) is in screen space (its extent already swapped for 90/270);
+  // touches mapped into it are un-rotated back to the source frame in to_video.
+  TouchMapper(int dw,
+              int dh,
+              int vx,
+              int vy,
+              int vw,
+              int vh,
+              SendFn send,
+              int rot_deg = 0)
       : dw_(dw),
         dh_(dh),
         vx_(vx),
@@ -35,6 +45,7 @@ class TouchMapper {
         vw_(vw),
         vh_(vh),
         send_(std::move(send)),
+        rot_deg_(rot_deg),
         cx_(dw / 2.0),
         cy_(dh / 2.0) {}
 
@@ -98,9 +109,55 @@ class TouchMapper {
     const double ly = (ndy * dh_ - vy_) / vh_;
     if (lx < 0.0 || lx > 1.0 || ly < 0.0 || ly > 1.0)
       return false;
-    ox = static_cast<float>(lx);
-    oy = static_cast<float>(ly);
+    // (lx,ly) is within the on-screen content rect, which holds the rotated
+    // image. Apply the inverse rotation to recover the coordinate in the
+    // unrotated video frame — the coordinate system the dongle expects.
+    double u = lx;
+    double v = ly;
+    switch (rot_deg_) {
+      case 90:
+        u = 1.0 - ly;
+        v = lx;
+        break;
+      case 180:
+        u = 1.0 - lx;
+        v = 1.0 - ly;
+        break;
+      case 270:
+        u = ly;
+        v = 1.0 - lx;
+        break;
+      default:  // 0 — identity
+        break;
+    }
+    ox = static_cast<float>(u);
+    oy = static_cast<float>(v);
     return true;
+  }
+
+  // Rotate a relative motion delta from the input frame into the display frame
+  // so the cursor tracks the rotated content (mouse-right moves the pointer
+  // along the content's rightward axis). The forward rotation here is the
+  // inverse of to_video's, so a drag's position still maps back correctly.
+  void rotate_delta(double& dx, double& dy) const {
+    const double x = dx;
+    const double y = dy;
+    switch (rot_deg_) {
+      case 90:
+        dx = y;
+        dy = -x;
+        break;
+      case 180:
+        dx = -x;
+        dy = -y;
+        break;
+      case 270:
+        dx = -y;
+        dy = x;
+        break;
+      default:  // 0 — identity
+        break;
+    }
   }
 
   void emit(TouchAction action, double ndx, double ndy) {
@@ -143,11 +200,13 @@ class TouchMapper {
   void handle_pointer(const drm::input::PointerEvent& pe) {
     if (const auto* m = std::get_if<drm::input::PointerMotionEvent>(&pe)) {
       double lx = 0, ly = 0;
+      double ddx = m->dx, ddy = m->dy;
+      rotate_delta(ddx, ddy);  // align motion with the rotated display
       {
         std::lock_guard<std::mutex> lk(cur_m_);
         const double g = down_ ? drag_gain_ : gain_;  // faster while dragging
-        cx_ = std::clamp(cx_ + m->dx * g, 0.0, static_cast<double>(dw_));
-        cy_ = std::clamp(cy_ + m->dy * g, 0.0, static_cast<double>(dh_));
+        cx_ = std::clamp(cx_ + ddx * g, 0.0, static_cast<double>(dw_));
+        cy_ = std::clamp(cy_ + ddy * g, 0.0, static_cast<double>(dh_));
         cursor_dirty_ = true;
         lx = cx_;
         ly = cy_;
@@ -176,6 +235,7 @@ class TouchMapper {
 
   int dw_, dh_, vx_, vy_, vw_, vh_;
   SendFn send_;
+  int rot_deg_ = 0;  // display rotation; un-rotates touches in to_video
   double gain_ = 2.5;
   double drag_gain_ =
       5.0;  // while a button is held; tune via CARLINKIT_DRAG_GAIN

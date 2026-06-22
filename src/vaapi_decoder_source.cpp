@@ -4,6 +4,7 @@
 
 extern "C" {
 #include <libavutil/frame.h>
+#include <libavutil/hwcontext.h>
 }
 #include <drm_fourcc.h>
 #include <unistd.h>
@@ -64,9 +65,67 @@ void VaapiDecoderSource::submit_bitstream(const uint8_t* data,
   decoder_.submit(data, len, pts_ns);
 }
 
+namespace {
+// Download a decoded VAAPI frame to CPU and write tightly-packed raw NV12 to
+// `<dir>/capture-WxH.nv12` (WxH from the frame's actual decoded size, so the
+// name always matches the bytes). Must run on the decode thread (the VAAPI
+// context is live there). The written path is returned in out_path.
+bool write_nv12_frame(AVFrame* hw,
+                      const std::string& dir,
+                      std::string& out_path) {
+  AVFrame* sw = av_frame_alloc();
+  if (sw == nullptr)
+    return false;
+  bool ok = false;
+  if (av_hwframe_transfer_data(sw, hw, 0) == 0 && sw->data[0] != nullptr &&
+      sw->data[1] != nullptr) {
+    const int w = sw->width;
+    const int h = sw->height;
+    char name[600];
+    std::snprintf(name, sizeof name, "%s/capture-%dx%d.nv12", dir.c_str(), w,
+                  h);
+    if (FILE* fp = std::fopen(name, "wb"); fp != nullptr) {
+      for (int y = 0; y < h; ++y)  // Y plane (stride may exceed width)
+        std::fwrite(sw->data[0] + static_cast<size_t>(y) * sw->linesize[0], 1,
+                    static_cast<size_t>(w), fp);
+      for (int y = 0; y < h / 2; ++y)  // interleaved UV plane
+        std::fwrite(sw->data[1] + static_cast<size_t>(y) * sw->linesize[1], 1,
+                    static_cast<size_t>(w), fp);
+      std::fclose(fp);
+      out_path = name;
+      ok = true;
+    }
+  }
+  av_frame_free(&sw);
+  return ok;
+}
+}  // namespace
+
+void VaapiDecoderSource::request_capture(const char* dir) {
+  {
+    std::lock_guard<std::mutex> lk(m_);
+    capture_dir_ = dir;
+  }
+  capture_req_ = true;  // serviced by the next on_decoded (decode thread)
+}
+
 // Decode-thread callback. No DRM ioctls here — just dup the dma-buf fds and
 // clone the surface-holding AVFrame, then stash as the pending frame.
 void VaapiDecoderSource::on_decoded(const DrmFrame& f, AVFrame* surface_frame) {
+  // Screenshot the freshly-decoded surface here (decode thread, live context).
+  if (capture_req_.exchange(false)) {
+    std::string dir;
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      dir = capture_dir_;
+    }
+    std::string written;
+    if (write_nv12_frame(surface_frame, dir, written))
+      std::fprintf(stderr, "[capture] wrote %s\n", written.c_str());
+    else
+      std::fprintf(stderr, "[capture] download failed\n");
+  }
+
   Pending p;
   p.valid = true;
   p.surface_id = f.surface_id;

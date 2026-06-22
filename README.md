@@ -3,6 +3,9 @@
 A C++/libusb receiver for Carlinkit **"Auto Box" CarPlay/Android Auto dongles**
 (USB `1314:1520` / `1314:1521`), with a zero-copy, hardware-plane video path:
 
+![CarPlay home screen scanned out on a KMS hardware plane by carlinkit-kms](docs/carplay-home.jpg)
+
+
 ```
 dongle ──USB bulk──► libusb async DMA ring ──► H.264 ──► HW decode (VAAPI / V4L2 M2M)
                                                             │ NV12 DMA-BUF (zero-copy)

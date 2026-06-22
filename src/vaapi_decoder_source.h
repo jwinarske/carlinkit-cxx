@@ -12,10 +12,12 @@
 // frame still on screen.
 #include <drm-cxx/scene/buffer_source.hpp>
 
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 
 #include "vaapi_decoder.h"
@@ -40,6 +42,13 @@ class VaapiDecoderSource : public drm::scene::LayerBufferSource {
 
   // Feed Annex-B H.264 bytes (called from the dongle's RX thread).
   void submit_bitstream(const uint8_t* data, size_t len, uint64_t pts_ns = 0);
+
+  // Request a screenshot: the next decoded frame is written to
+  // `<dir>/capture-WxH.nv12` as tightly-packed raw NV12 (w*h Y + w*h/2
+  // interleaved UV), WxH being the frame's actual decoded size. The download
+  // runs on the decode thread, where the VAAPI context is live. Convert with
+  // e.g. ffmpeg -f rawvideo -pix_fmt nv12 -s WxH -i file.nv12 out.png
+  void request_capture(const char* dir);
 
   // ── drm::scene::LayerBufferSource ──────────────────────────────────────────
   drm::expected<drm::scene::AcquiredBuffer, std::error_code> acquire() override;
@@ -92,6 +101,10 @@ class VaapiDecoderSource : public drm::scene::LayerBufferSource {
   std::deque<AVFrame*> retained_;
   uint32_t current_fb_ = 0;
   static constexpr size_t kRetain = 4;
+
+  // Screenshot request: the next decoded frame is written under capture_dir_.
+  std::atomic<bool> capture_req_{false};
+  std::string capture_dir_;  // guarded by m_
 };
 
 }  // namespace ck

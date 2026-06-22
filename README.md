@@ -11,8 +11,7 @@ dongle ──USB bulk──► libusb async DMA ring ──► H.264 ──► H
 ```
 
 The phone connects to the dongle **wirelessly** (Wi-Fi + Bluetooth); nothing is
-plugged into the dongle. See `docs/ARCHITECTURE.md` for the full design and
-`docs/FINDINGS.md` for the reverse-engineering notes.
+plugged into the dongle. See `docs/ARCHITECTURE.md` for the full design.
 
 ## Targets
 

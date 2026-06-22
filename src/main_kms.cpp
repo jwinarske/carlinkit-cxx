@@ -53,8 +53,12 @@
 
 namespace {
 std::atomic<bool> g_quit{false};
+std::atomic<bool> g_capture{false};
 void on_sigint(int) {
   g_quit = true;
+}
+void on_sigusr1(int) {  // request a screenshot of the current decoded frame
+  g_capture = true;
 }
 
 // DPI from the connector's physical size: round(hdisplay / (mmWidth / 25.4)).
@@ -237,6 +241,7 @@ std::optional<ConnectorSel> select_connector(int fd, const char* want) {
 int main(int argc, char** argv) {
   std::signal(SIGINT, on_sigint);
   std::signal(SIGTERM, on_sigint);
+  std::signal(SIGUSR1, on_sigusr1);  // screenshot the current frame
 
   // Pull our flags out of argv so the drm-cxx output picker doesn't see them.
   bool list_modes_flag = false;
@@ -575,7 +580,12 @@ int main(int argc, char** argv) {
   std::fprintf(stderr, "playing — Esc/Q/Ctrl-C to quit\n");
 
   // Render loop: page-flip pacing + one coalesced cursor move + scene commit.
+  const char* capture_dir = std::getenv("CARLINKIT_CAPTURE_DIR");
+  if (capture_dir == nullptr)
+    capture_dir = ".";
   while (!g_quit && !mapper.quit()) {
+    if (g_capture.exchange(false) && vsrc != nullptr)
+      vsrc->request_capture(capture_dir);  // written by the next decoded frame
     pollfd p{dev.fd(), POLLIN, 0};
     if (::poll(&p, 1, flip_pending ? 100 : 8) > 0 && (p.revents & POLLIN))
       (void)page_flip.dispatch(0);

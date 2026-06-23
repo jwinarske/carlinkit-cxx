@@ -18,6 +18,31 @@ extern "C" {
 #include <cstring>
 
 namespace ck {
+namespace {
+
+// libavcodec tags full-range planar YUV with the deprecated yuvj* formats,
+// which make libswscale emit a per-frame "deprecated pixel format" warning. Map
+// them to their canonical equivalents; with matching default ranges the convert
+// to NV12 is a pure planar->semiplanar repack (sample values unchanged), so the
+// output matches the VAAPI path rather than getting range-shifted.
+AVPixelFormat canonical_pix_fmt(int fmt) {
+  switch (fmt) {
+    case AV_PIX_FMT_YUVJ420P:
+      return AV_PIX_FMT_YUV420P;
+    case AV_PIX_FMT_YUVJ422P:
+      return AV_PIX_FMT_YUV422P;
+    case AV_PIX_FMT_YUVJ444P:
+      return AV_PIX_FMT_YUV444P;
+    case AV_PIX_FMT_YUVJ440P:
+      return AV_PIX_FMT_YUV440P;
+    case AV_PIX_FMT_YUVJ411P:
+      return AV_PIX_FMT_YUV411P;
+    default:
+      return static_cast<AVPixelFormat>(fmt);
+  }
+}
+
+}  // namespace
 
 std::unique_ptr<SoftwareDecoderSource> SoftwareDecoderSource::create(
     drm::Device& dev,
@@ -129,7 +154,7 @@ void SoftwareDecoderSource::on_frame(const AVFrame* frame) {
   // Build (or rebuild, if the source pixel format changed) the converter to
   // NV12 at the same dimensions — no scaling, just a format/layout convert.
   sws_ = sws_getCachedContext(sws_, static_cast<int>(w), static_cast<int>(h),
-                              static_cast<AVPixelFormat>(frame->format),
+                              canonical_pix_fmt(frame->format),
                               static_cast<int>(w), static_cast<int>(h),
                               AV_PIX_FMT_NV12, SWS_POINT, nullptr, nullptr,
                               nullptr);

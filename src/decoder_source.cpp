@@ -9,6 +9,7 @@
 
 #include "software_decoder_source.h"
 #ifndef CARLINKIT_SOFTWARE_ONLY
+#include "v4l2_decoder_source_adapter.h"
 #include "vaapi_decoder_source.h"
 #endif
 
@@ -82,10 +83,17 @@ std::unique_ptr<DecoderSource> create_decoder_source(drm::Device& dev,
     std::fprintf(stderr, "VAAPI unavailable; trying next backend\n");
   }
 
-  // V4L2 — a stateful SoC decoder (added to the chain separately).
-  if (pref == DecoderBackend::V4l2) {
-    std::fprintf(stderr, "V4L2 decoder backend unavailable\n");
-    return nullptr;
+  // V4L2 — a stateful SoC decoder.
+  if (pref == DecoderBackend::Auto || pref == DecoderBackend::V4l2) {
+    if (auto s = V4l2DecoderSourceAdapter::create(dev, coded_w, coded_h)) {
+      std::fprintf(stderr, "decoder: V4L2 (SoC HW decoder)\n");
+      return s;
+    }
+    if (pref == DecoderBackend::V4l2) {
+      std::fprintf(stderr, "CARLINKIT_DECODER=v4l2 but V4L2 open failed\n");
+      return nullptr;
+    }
+    std::fprintf(stderr, "V4L2 unavailable; trying next backend\n");
   }
 
   // Software — the always-available CPU fallback (pinned, or the end of Auto).

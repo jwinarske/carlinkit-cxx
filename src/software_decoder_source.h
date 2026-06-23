@@ -18,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "decoder_source.h"
 
@@ -36,11 +37,14 @@ namespace ck {
 class SoftwareDecoderSource : public DecoderSource {
  public:
   // coded_w/h seed the reported format until the first frame locks in the
-  // actual decoded size (which sizes the dumb-buffer pool). Returns nullptr if
-  // the software H.264 decoder cannot be opened.
+  // actual decoded size (which sizes the dumb-buffer pool). `rot` is a
+  // DRM_MODE_ROTATE_* bit baked into the output buffer on the CPU (the plane is
+  // not asked to rotate). Returns nullptr if the H.264 decoder cannot be
+  // opened.
   static std::unique_ptr<SoftwareDecoderSource> create(drm::Device& dev,
                                                        uint32_t coded_w,
-                                                       uint32_t coded_h);
+                                                       uint32_t coded_h,
+                                                       uint64_t rot);
 
   ~SoftwareDecoderSource() override;
 
@@ -48,6 +52,9 @@ class SoftwareDecoderSource : public DecoderSource {
                         size_t len,
                         uint64_t pts_ns) override;
   void request_capture(const char* dir) override;
+  [[nodiscard]] uint64_t applied_rotation() const noexcept override {
+    return rot_;
+  }
 
   // ── drm::scene::LayerBufferSource ──────────────────────────────────────────
   drm::expected<drm::scene::AcquiredBuffer, std::error_code> acquire() override;
@@ -58,13 +65,26 @@ class SoftwareDecoderSource : public DecoderSource {
   drm::scene::SourceFormat format() const noexcept override;
 
  private:
-  SoftwareDecoderSource(drm::Device& dev, int drm_fd, uint32_t w, uint32_t h);
+  SoftwareDecoderSource(drm::Device& dev,
+                        int drm_fd,
+                        uint32_t w,
+                        uint32_t h,
+                        uint64_t rot);
   bool open_codec();
   void decode_packet(AVPacket* pkt);    // RX thread
   void on_frame(const AVFrame* frame);  // RX thread
-  bool ensure_pool(uint32_t w,
-                   uint32_t h);       // RX thread; sets fmt_/pool under m_
+  // Output (post-rotation) dimensions for a source frame: 90/270 swap w<->h.
+  void out_dims(uint32_t sw, uint32_t sh, uint32_t& ow, uint32_t& oh) const;
+  bool ensure_pool(uint32_t sw,
+                   uint32_t sh);      // RX thread; sets fmt_/pool under m_
   int pick_free_slot_locked() const;  // holds m_
+  // Rotate a packed NV12 frame (src, sw x sh, both planes stride = sw) into the
+  // dumb buffer `dst` (stride dstride) by rot_. RX thread.
+  void rotate_nv12(const uint8_t* src,
+                   uint32_t sw,
+                   uint32_t sh,
+                   uint8_t* dst,
+                   uint32_t dstride) const;
   void write_capture(int slot, uint32_t w, uint32_t h) const;
 
   // One CPU-mapped dumb buffer holding a full NV12 frame, imported once as a
@@ -82,6 +102,8 @@ class SoftwareDecoderSource : public DecoderSource {
 
   drm::Device& dev_;
   int drm_fd_;
+  uint64_t rot_ = 0;  // DRM_MODE_ROTATE_* baked into the output on the CPU
+  std::vector<uint8_t> staging_{};  // NV12 at source dims; rotated into buffer
 
   AVCodecContext* ctx_ = nullptr;
   AVCodecParserContext* parser_ = nullptr;

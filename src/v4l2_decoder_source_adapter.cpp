@@ -11,6 +11,7 @@
 #include <drm-cxx/detail/span.hpp>
 #include <drm-cxx/scene/v4l2_decoder_source.hpp>
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -165,7 +166,14 @@ void V4l2DecoderSourceAdapter::pump() {
     pfds[1].revents = 0;
     // 50 ms cap so a full OUTPUT queue (EAGAIN) is retried after drive() frees
     // a buffer even if fd() doesn't signal, and so running_ is rechecked.
-    poll(pfds, 2, 50);
+    const int pr = poll(pfds, 2, 50);
+    if (pr < 0 && errno != EINTR) {
+      // A persistent poll error (e.g. a bad fd) would otherwise busy-spin;
+      // treat it as fatal rather than burn a core.
+      std::fprintf(stderr, "v4l2: poll failed: %s\n", std::strerror(errno));
+      failed_ = true;
+      return;
+    }
     if ((pfds[1].revents & POLLIN) != 0) {
       char buf[64];
       while (read(wake_r_, buf, sizeof buf) > 0) {

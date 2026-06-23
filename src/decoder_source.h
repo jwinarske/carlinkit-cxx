@@ -39,6 +39,12 @@ class DecoderSource : public drm::scene::LayerBufferSource {
   // (tightly-packed NV12). Backends with no CPU access to decoded frames may
   // ignore the request; the default is a no-op.
   virtual void request_capture(const char* /*dir*/) {}
+
+  // The display rotation (a DRM_MODE_ROTATE_* bit) the source has already baked
+  // into its output buffer, so format() is in final orientation and the caller
+  // must not also rotate the plane. 0 means the source did not rotate (the
+  // caller drives plane rotation). Only the software backend overrides this.
+  [[nodiscard]] virtual uint64_t applied_rotation() const noexcept { return 0; }
 };
 
 // Which backend create_decoder_source should use. Auto runs the full fallback
@@ -51,9 +57,12 @@ enum class DecoderBackend { Auto, Vaapi, V4l2, Software };
 // software, and uses the first that opens. A CARLINKIT_SOFTWARE_ONLY build
 // compiles in only the software backend. coded_w/coded_h seed the decoder's
 // buffer pool (the dongle's Open resolution). Returns nullptr if no backend
-// could be opened.
+// could be opened. `rot` is a DRM_MODE_ROTATE_* bit the software backend bakes
+// into its output (hardware backends ignore it and leave plane rotation to the
+// caller); pass DRM_MODE_ROTATE_0 for none.
 std::unique_ptr<DecoderSource> create_decoder_source(drm::Device& dev,
                                                      uint32_t coded_w,
-                                                     uint32_t coded_h);
+                                                     uint32_t coded_h,
+                                                     uint64_t rot);
 
 }  // namespace ck

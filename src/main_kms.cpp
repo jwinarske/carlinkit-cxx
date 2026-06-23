@@ -429,18 +429,49 @@ int main(int argc, char** argv) {
                dcfg.fps, dcfg.dpi, dcfg.aaWidth != 0 ? dcfg.aaWidth : vw,
                dcfg.aaHeight != 0 ? dcfg.aaHeight : vh);
 
-  // Optional display rotation (CARLINKIT_ROTATE=90|180|270). We use the HW
-  // plane's rotation property when a candidate NV12 plane advertises the angle;
-  // otherwise drm-cxx would fall back to CPU pre-rotation, which our tiled
-  // DMA-BUF video can't take (and would cripple even if it could) — so we warn
-  // loudly. 90/270 swap the on-screen aspect, handled in the fit below.
+  // Optional display rotation (CARLINKIT_ROTATE=90|180|270). How it is realized
+  // depends on the decode backend, decided once the source exists (below): the
+  // software backend bakes rotation into its CPU convert and presents an
+  // already-oriented buffer; VAAPI/V4L2 rotate their tiled buffer on the HW
+  // plane.
   const uint64_t rot = requested_rotation();
-  const bool swap_wh = rot == DRM_MODE_ROTATE_90 || rot == DRM_MODE_ROTATE_270;
+
+  drm::scene::LayerScene::Config cfg;
+  cfg.crtc_id = out->crtc_id;
+  cfg.connector_id = out->connector_id;
+  cfg.mode = out->mode;
+  auto scene_r = drm::scene::LayerScene::create(dev, cfg);
+  if (!scene_r) {
+    std::fprintf(stderr, "LayerScene::create: %s\n",
+                 scene_r.error().message().c_str());
+    return 1;
+  }
+  auto scene = std::move(*scene_r);
+
+  auto src = ck::create_decoder_source(dev, vw, vh, rot);
+  if (!src) {
+    std::fprintf(stderr, "no video decoder available\n");
+    return 1;
+  }
+
+  // A source that baked the rotation in (the software backend) reports it via
+  // applied_rotation(); whatever it did not handle is left for the HW plane.
+  // The plane angle drives swap_wh, because the source's own buffer is already
+  // in its final orientation (format() reflects it), so the on-screen aspect is
+  // only swapped by what the plane still rotates.
+  const uint64_t applied = src->applied_rotation();
+  const uint64_t plane_rot = applied != 0 ? 0 : rot;
+  const bool swap_wh =
+      plane_rot == DRM_MODE_ROTATE_90 || plane_rot == DRM_MODE_ROTATE_270;
   if (rot != 0) {
     const unsigned deg = rot == DRM_MODE_ROTATE_90    ? 90
                          : rot == DRM_MODE_ROTATE_180 ? 180
                                                       : 270;
-    if ((connector_rotation_caps(dev.fd(), out->connector_id) & rot) != 0) {
+    if (applied != 0) {
+      std::fprintf(stderr, "rotating video %u degrees in software (CPU)\n",
+                   deg);
+    } else if ((connector_rotation_caps(dev.fd(), out->connector_id) & rot) !=
+               0) {
       std::fprintf(stderr, "rotating video %u degrees on the HW plane\n", deg);
     } else {
       std::fprintf(
@@ -457,43 +488,28 @@ int main(int argc, char** argv) {
           deg);
     }
   }
-
-  drm::scene::LayerScene::Config cfg;
-  cfg.crtc_id = out->crtc_id;
-  cfg.connector_id = out->connector_id;
-  cfg.mode = out->mode;
-  auto scene_r = drm::scene::LayerScene::create(dev, cfg);
-  if (!scene_r) {
-    std::fprintf(stderr, "LayerScene::create: %s\n",
-                 scene_r.error().message().c_str());
-    return 1;
-  }
-  auto scene = std::move(*scene_r);
-
-  auto src = ck::create_decoder_source(dev, vw, vh);
-  if (!src) {
-    std::fprintf(stderr, "no video decoder available\n");
-    return 1;
-  }
+  // Source rect = the source buffer's own dimensions (format() already reflects
+  // any rotation the source applied); read before the source is moved away.
+  const drm::scene::SourceFormat sf0 = src->format();
 
   drm::scene::LayerDesc desc;
   desc.source = std::move(src);
-  // Aspect-preserving fit of the vw x vh video into the W x H display, done by
-  // the HW plane scaler (zero CPU). fv* is the final on-screen video rect; it
-  // is reduced to native size below if the plane turns out not to scale. Under
-  // 90/270 rotation the content is portrait, so fit the swapped dimensions.
-  const uint32_t ivw = swap_wh ? vh : vw;
-  const uint32_t ivh = swap_wh ? vw : vh;
+  // Aspect-preserving fit of the video into the W x H display, done by the HW
+  // plane scaler (zero CPU). fv* is the final on-screen video rect; it is
+  // reduced to native size below if the plane turns out not to scale. Under
+  // 90/270 plane rotation the content is portrait, so fit the swapped extents.
+  const uint32_t ivw = swap_wh ? sf0.height : sf0.width;
+  const uint32_t ivh = swap_wh ? sf0.width : sf0.height;
   const double fit = std::min(double(W) / ivw, double(H) / ivh);
   int fvw = static_cast<int>(std::lround(ivw * fit));
   int fvh = static_cast<int>(std::lround(ivh * fit));
   int fvx = (int(W) - fvw) / 2;
   int fvy = (int(H) - fvh) / 2;
-  desc.display.src_rect = drm::scene::Rect{0, 0, vw, vh};
+  desc.display.src_rect = drm::scene::Rect{0, 0, sf0.width, sf0.height};
   desc.display.dst_rect =
       drm::scene::Rect{fvx, fvy, uint32_t(fvw), uint32_t(fvh)};
-  if (rot != 0)
-    desc.display.rotation = rot;
+  if (plane_rot != 0)
+    desc.display.rotation = plane_rot;
   desc.content_type = drm::planes::ContentType::Video;
   auto lh = scene->add_layer(std::move(desc));
   if (!lh) {

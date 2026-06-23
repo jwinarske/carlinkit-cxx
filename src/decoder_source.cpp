@@ -47,8 +47,9 @@ void software_warning() {
 
 std::unique_ptr<DecoderSource> make_software(drm::Device& dev,
                                              uint32_t coded_w,
-                                             uint32_t coded_h) {
-  if (auto s = SoftwareDecoderSource::create(dev, coded_w, coded_h)) {
+                                             uint32_t coded_h,
+                                             uint64_t rot) {
+  if (auto s = SoftwareDecoderSource::create(dev, coded_w, coded_h, rot)) {
     software_warning();
     std::fprintf(stderr, "decoder: software (CPU H.264 -> NV12 dumb buffer)\n");
     return s;
@@ -61,14 +62,15 @@ std::unique_ptr<DecoderSource> make_software(drm::Device& dev,
 
 std::unique_ptr<DecoderSource> create_decoder_source(drm::Device& dev,
                                                      uint32_t coded_w,
-                                                     uint32_t coded_h) {
+                                                     uint32_t coded_h,
+                                                     uint64_t rot) {
   const DecoderBackend pref = parse_pref();
 
 #ifdef CARLINKIT_SOFTWARE_ONLY
   if (pref != DecoderBackend::Auto && pref != DecoderBackend::Software)
     std::fprintf(stderr,
                  "built software-only; ignoring CARLINKIT_DECODER override\n");
-  return make_software(dev, coded_w, coded_h);
+  return make_software(dev, coded_w, coded_h, rot);
 #else
   // VAAPI — the zero-copy HW-plane path.
   if (pref == DecoderBackend::Auto || pref == DecoderBackend::Vaapi) {
@@ -97,7 +99,7 @@ std::unique_ptr<DecoderSource> create_decoder_source(drm::Device& dev,
   }
 
   // Software — the always-available CPU fallback (pinned, or the end of Auto).
-  return make_software(dev, coded_w, coded_h);
+  return make_software(dev, coded_w, coded_h, rot);
 #endif
 }
 

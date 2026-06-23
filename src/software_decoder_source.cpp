@@ -8,6 +8,7 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 #include <drm_fourcc.h>
+#include <drm_mode.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <xf86drm.h>
@@ -47,9 +48,10 @@ AVPixelFormat canonical_pix_fmt(int fmt) {
 std::unique_ptr<SoftwareDecoderSource> SoftwareDecoderSource::create(
     drm::Device& dev,
     uint32_t coded_w,
-    uint32_t coded_h) {
+    uint32_t coded_h,
+    uint64_t rot) {
   auto src = std::unique_ptr<SoftwareDecoderSource>(
-      new SoftwareDecoderSource(dev, dev.fd(), coded_w, coded_h));
+      new SoftwareDecoderSource(dev, dev.fd(), coded_w, coded_h, rot));
   if (!src->open_codec())
     return nullptr;
   return src;
@@ -58,12 +60,29 @@ std::unique_ptr<SoftwareDecoderSource> SoftwareDecoderSource::create(
 SoftwareDecoderSource::SoftwareDecoderSource(drm::Device& dev,
                                              int drm_fd,
                                              uint32_t w,
-                                             uint32_t h)
-    : dev_(dev), drm_fd_(drm_fd) {
+                                             uint32_t h,
+                                             uint64_t rot)
+    : dev_(dev), drm_fd_(drm_fd), rot_(rot) {
+  uint32_t ow = w;
+  uint32_t oh = h;
+  out_dims(w, h, ow, oh);  // seed format() in final orientation pre-first-frame
   fmt_.drm_fourcc = DRM_FORMAT_NV12;
   fmt_.modifier = DRM_FORMAT_MOD_LINEAR;
-  fmt_.width = w;
-  fmt_.height = h;
+  fmt_.width = ow;
+  fmt_.height = oh;
+}
+
+void SoftwareDecoderSource::out_dims(uint32_t sw,
+                                     uint32_t sh,
+                                     uint32_t& ow,
+                                     uint32_t& oh) const {
+  if (rot_ == DRM_MODE_ROTATE_90 || rot_ == DRM_MODE_ROTATE_270) {
+    ow = sh;
+    oh = sw;
+  } else {
+    ow = sw;
+    oh = sh;
+  }
 }
 
 SoftwareDecoderSource::~SoftwareDecoderSource() {
@@ -148,6 +167,17 @@ void SoftwareDecoderSource::on_frame(const AVFrame* frame) {
   const auto h = static_cast<uint32_t>(frame->height);
   if (w == 0 || h == 0)
     return;
+  // NV12 is 4:2:0: the dumb-buffer layout (h*3/2 rows) and the chroma loops
+  // assume even dimensions. H.264 4:2:0 always decodes to even sizes; guard so
+  // a malformed odd frame drops rather than truncating a chroma line.
+  if ((w & 1U) != 0 || (h & 1U) != 0) {
+    if (!res_warned_) {
+      std::fprintf(stderr, "software: odd frame %ux%u unsupported; dropping\n",
+                   w, h);
+      res_warned_ = true;
+    }
+    return;
+  }
   if (!ensure_pool(w, h))
     return;
 
@@ -172,15 +202,32 @@ void SoftwareDecoderSource::on_frame(const AVFrame* frame) {
     return;  // no free buffer (should not happen with kBufs >= 3)
 
   Buf& b = bufs_[slot];
-  uint8_t* dst[4] = {b.map, b.map + static_cast<size_t>(b.stride) * h, nullptr,
-                     nullptr};
-  int dst_stride[4] = {static_cast<int>(b.stride), static_cast<int>(b.stride),
-                       0, 0};
-  sws_scale(sws_, frame->data, frame->linesize, 0, static_cast<int>(h), dst,
-            dst_stride);
+  if (rot_ == 0) {
+    // Convert straight into the dumb buffer (Y then interleaved UV).
+    uint8_t* dst[4] = {b.map, b.map + static_cast<size_t>(b.stride) * h,
+                       nullptr, nullptr};
+    int dst_stride[4] = {static_cast<int>(b.stride), static_cast<int>(b.stride),
+                         0, 0};
+    sws_scale(sws_, frame->data, frame->linesize, 0, static_cast<int>(h), dst,
+              dst_stride);
+  } else {
+    // Convert to a packed NV12 staging buffer, then rotate into the buffer.
+    staging_.resize(static_cast<size_t>(w) * h * 3 / 2);
+    uint8_t* dst[4] = {staging_.data(),
+                       staging_.data() + static_cast<size_t>(w) * h, nullptr,
+                       nullptr};
+    int dst_stride[4] = {static_cast<int>(w), static_cast<int>(w), 0, 0};
+    sws_scale(sws_, frame->data, frame->linesize, 0, static_cast<int>(h), dst,
+              dst_stride);
+    rotate_nv12(staging_.data(), w, h, b.map, b.stride);
+  }
 
-  if (capture_req_.exchange(false))
-    write_capture(slot, w, h);
+  if (capture_req_.exchange(false)) {
+    uint32_t ow = w;
+    uint32_t oh = h;
+    out_dims(w, h, ow, oh);
+    write_capture(slot, ow, oh);  // capture the oriented output buffer
+  }
 
   std::lock_guard<std::mutex> lk(m_);
   pending_ = slot;  // latest-frame-wins; any prior unconsumed pending is freed
@@ -204,13 +251,18 @@ bool SoftwareDecoderSource::ensure_pool(uint32_t w, uint32_t h) {
     return true;
   }
 
-  // NV12 in a single dumb buffer: Y plane (h rows) followed by the interleaved
-  // UV plane (h/2 rows), so the buffer is h*3/2 rows of `pitch` bytes.
+  // Buffers are sized at the post-rotation (output) dimensions; for 90/270 that
+  // is the source with w/h swapped. NV12 in a single dumb buffer: Y plane (oh
+  // rows) followed by the interleaved UV plane (oh/2 rows), so the buffer is
+  // oh*3/2 rows of `pitch` bytes.
+  uint32_t ow = w;
+  uint32_t oh = h;
+  out_dims(w, h, ow, oh);
   for (Buf& b : bufs_) {
     uint32_t handle = 0;
     uint32_t pitch = 0;
     uint64_t size = 0;
-    if (drmModeCreateDumbBuffer(drm_fd_, w, h * 3 / 2, 8, 0, &handle, &pitch,
+    if (drmModeCreateDumbBuffer(drm_fd_, ow, oh * 3 / 2, 8, 0, &handle, &pitch,
                                 &size) != 0) {
       std::fprintf(stderr, "software: drmModeCreateDumbBuffer failed\n");
       return false;
@@ -232,10 +284,10 @@ bool SoftwareDecoderSource::ensure_pool(uint32_t w, uint32_t h) {
 
     uint32_t handles[4] = {handle, handle, 0, 0};
     uint32_t pitches[4] = {pitch, pitch, 0, 0};
-    uint32_t offsets[4] = {0, pitch * h, 0, 0};
+    uint32_t offsets[4] = {0, pitch * oh, 0, 0};
     uint32_t fb = 0;
-    if (drmModeAddFB2(drm_fd_, w, h, DRM_FORMAT_NV12, handles, pitches, offsets,
-                      &fb, 0) != 0) {
+    if (drmModeAddFB2(drm_fd_, ow, oh, DRM_FORMAT_NV12, handles, pitches,
+                      offsets, &fb, 0) != 0) {
       std::fprintf(stderr, "software: drmModeAddFB2 failed\n");
       munmap(map, size);
       drmModeDestroyDumbBuffer(drm_fd_, handle);
@@ -249,12 +301,12 @@ bool SoftwareDecoderSource::ensure_pool(uint32_t w, uint32_t h) {
   }
 
   std::lock_guard<std::mutex> lk(m_);
-  frame_w_ = w;
+  frame_w_ = w;  // source dims, for resolution-change detection
   frame_h_ = h;
   fmt_.drm_fourcc = DRM_FORMAT_NV12;
   fmt_.modifier = DRM_FORMAT_MOD_LINEAR;
-  fmt_.width = w;
-  fmt_.height = h;
+  fmt_.width = ow;
+  fmt_.height = oh;
   pool_ready_ = true;
   return true;
 }
@@ -268,6 +320,71 @@ int SoftwareDecoderSource::pick_free_slot_locked() const {
     if (i != displayed_ && i != pending_ && !bufs_[i].in_flight)
       return i;
   return -1;
+}
+
+void SoftwareDecoderSource::rotate_nv12(const uint8_t* src,
+                                        uint32_t sw,
+                                        uint32_t sh,
+                                        uint8_t* dst,
+                                        uint32_t dstride) const {
+  // src is packed NV12 (Y: sw x sh stride sw; UV: sw/2 pairs x sh/2 stride sw).
+  // dst is the dumb buffer NV12 at output dims (Y stride dstride, UV at
+  // dst + dstride*oh). DRM rotation is counter-clockwise, so we rotate the
+  // image CCW by rot_ to match what the HW plane would do on the other
+  // backends.
+  uint32_t ow = sw;
+  uint32_t oh = sh;
+  out_dims(sw, sh, ow, oh);
+  const uint8_t* sy = src;
+  const uint8_t* suv = src + static_cast<size_t>(sw) * sh;
+  uint8_t* dy = dst;
+  uint8_t* duv = dst + static_cast<size_t>(dstride) * oh;
+  const uint32_t cw = sw / 2;  // source chroma: pair-columns, rows
+  const uint32_t ch = sh / 2;
+  const uint32_t dcw = ow / 2;  // dst chroma
+  const uint32_t dch = oh / 2;
+
+  if (rot_ == DRM_MODE_ROTATE_180) {
+    for (uint32_t y = 0; y < oh; ++y)
+      for (uint32_t x = 0; x < ow; ++x)
+        dy[static_cast<size_t>(y) * dstride + x] =
+            sy[static_cast<size_t>(sh - 1 - y) * sw + (sw - 1 - x)];
+    for (uint32_t y = 0; y < dch; ++y)
+      for (uint32_t x = 0; x < dcw; ++x) {
+        const uint8_t* s = &suv[static_cast<size_t>(ch - 1 - y) * sw +
+                                static_cast<size_t>(cw - 1 - x) * 2];
+        uint8_t* d =
+            &duv[static_cast<size_t>(y) * dstride + static_cast<size_t>(x) * 2];
+        d[0] = s[0];
+        d[1] = s[1];
+      }
+    return;
+  }
+
+  // 90 CCW: dst(dc,dr) = src col (sw-1-dr), row dc.
+  // 270 CCW: dst(dc,dr) = src col dr, row (sh-1-dc).
+  // dc is the outer loop so the inner loop (dr) walks the source contiguously
+  // (the strided access lands on the write side — the dumb buffer is
+  // write-combined and tolerates that better than scattered cached reads).
+  const bool r90 = rot_ == DRM_MODE_ROTATE_90;
+  for (uint32_t dc = 0; dc < ow; ++dc)
+    for (uint32_t dr = 0; dr < oh; ++dr) {
+      const uint32_t sx = r90 ? sw - 1 - dr : dr;
+      const uint32_t syi = r90 ? dc : sh - 1 - dc;
+      dy[static_cast<size_t>(dr) * dstride + dc] =
+          sy[static_cast<size_t>(syi) * sw + sx];
+    }
+  for (uint32_t dc = 0; dc < dcw; ++dc)
+    for (uint32_t dr = 0; dr < dch; ++dr) {
+      const uint32_t scx = r90 ? cw - 1 - dr : dr;
+      const uint32_t scy = r90 ? dc : ch - 1 - dc;
+      const uint8_t* s =
+          &suv[static_cast<size_t>(scy) * sw + static_cast<size_t>(scx) * 2];
+      uint8_t* d =
+          &duv[static_cast<size_t>(dr) * dstride + static_cast<size_t>(dc) * 2];
+      d[0] = s[0];
+      d[1] = s[1];
+    }
 }
 
 void SoftwareDecoderSource::write_capture(int slot,

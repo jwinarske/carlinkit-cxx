@@ -15,9 +15,9 @@ sends touch, with a zero-copy, hardware-plane display path.
                                                    │  VideoData(H.264 Annex-B)  AudioData(PCM)  Touch◄
                               ┌────────────────────┼─────────────────────┐
                               ▼ H.264 NAL          ▼ PCM                  ▲ SendTouch
-                  VaapiDecoderSource / V4l2DecoderSource   AudioOutput (ALSA)   TouchMapper
+                  DecoderSource (VAAPI / V4L2 / software)  AudioOutput (ALSA)   TouchMapper
                   (a drm::scene::LayerBufferSource)                             (drm-cxx libinput)
-                                                   │ NV12 DMA-BUF (decoded, never touches CPU)
+                                                   │ NV12 DMA-BUF (decoded; CPU copy only on software path)
                                                    ▼
                                        drm-cxx LayerScene / atomic commit
                                                    ▼
@@ -49,17 +49,34 @@ tears the session down on surprise removal, so the rest of the graph keeps runni
   (the display controller's scaler) — also zero CPU.
 
 ## Decoder
-The decoder is a `drm::scene::LayerBufferSource` the scene scans out directly.
-Two backends:
+The decoder is a `ck::DecoderSource` (a `drm::scene::LayerBufferSource` plus a
+`submit_bitstream` feed) the scene scans out directly. `create_decoder_source`
+(`src/decoder_source.cpp`) selects a backend: `CARLINKIT_DECODER`
+(`vaapi`/`v4l2`/`software`/`auto`, default `auto`) pins one, and `auto` tries
+VAAPI, then V4L2, then software, using the first that opens. A pinned backend
+that fails to open is an error rather than a fall-through.
+
 - **`VaapiDecoderSource`** (this AMD desktop) — `src/vaapi_decoder*.cpp`.
   libavcodec H.264 + VAAPI hwaccel on `renderD128`; each decoded VASurface is
   exported with `vaExportSurfaceHandle` (`COMPOSED_LAYERS`) as a DRM-PRIME NV12
   DMA-BUF, imported as a KMS framebuffer. An AVFrame ref is retained per imported
   framebuffer (a small ring) so the decoder's surface pool can't overwrite a
   frame still on screen.
-- **`V4l2DecoderSource`** (embedded SoC, e.g. Rockchip) — drm-cxx's in-tree
-  stateful V4L2 M2M decoder source: `submit_bitstream(annexb)` → decode →
-  NV12 DMA-BUF → KMS framebuffer, no GStreamer.
+- **`V4l2DecoderSourceAdapter`** (embedded SoC, e.g. Rockchip) —
+  `src/v4l2_decoder_source_adapter.cpp`. Wraps drm-cxx's stateful V4L2 M2M
+  decoder source (NV12 DMA-BUF → KMS framebuffer, no GStreamer). The inner source
+  is event-loop shaped (poll `fd()`, `drive()`, `submit_bitstream` returns EAGAIN
+  when full); the adapter runs a pump thread that drives the decoder and feeds
+  queued coded chunks, so the dongle RX thread just enqueues. The decoder is
+  found via `CARLINKIT_V4L2_DEV` or a scan of `/dev/video*`.
+- **`SoftwareDecoderSource`** (the always-available fallback) —
+  `src/software_decoder_source.cpp`. libavcodec CPU H.264 decode, converted to
+  NV12 with libswscale into a pool of LINEAR DRM dumb buffers scanned out on the
+  HW plane. No GPU/VAAPI/V4L2, so it works anywhere, but the per-frame decode +
+  convert + copy is slow — it prints a loud warning when it engages. A pool slot
+  stays reserved (`in_flight`) from `acquire()` until `release()` so a buffer
+  still on screen is never refilled. `CARLINKIT_SOFTWARE_ONLY` (CMake) builds
+  only this backend, omitting VAAPI/V4L2 and the direct libva link.
 
 ## drm-cxx integration facts (from source)
 - `drm::scene::LayerBufferSource` is the interface the scene consumes:

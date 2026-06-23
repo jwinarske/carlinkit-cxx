@@ -10,8 +10,6 @@
 // one KMS framebuffer per surface (cached by VASurfaceID, created once) and
 // hold an AVFrame ref for the last few frames so the pool cannot overwrite a
 // frame still on screen.
-#include <drm-cxx/scene/buffer_source.hpp>
-
 #include <atomic>
 #include <cstdint>
 #include <deque>
@@ -20,6 +18,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "decoder_source.h"
 #include "vaapi_decoder.h"
 
 namespace drm {
@@ -28,7 +27,7 @@ class Device;
 
 namespace ck {
 
-class VaapiDecoderSource : public drm::scene::LayerBufferSource {
+class VaapiDecoderSource : public DecoderSource {
  public:
   // coded_w/h size the decoder's surface pool; should match the dongle's Open
   // resolution. Returns nullptr on decoder-open failure.
@@ -41,14 +40,16 @@ class VaapiDecoderSource : public drm::scene::LayerBufferSource {
   ~VaapiDecoderSource() override;
 
   // Feed Annex-B H.264 bytes (called from the dongle's RX thread).
-  void submit_bitstream(const uint8_t* data, size_t len, uint64_t pts_ns = 0);
+  void submit_bitstream(const uint8_t* data,
+                        size_t len,
+                        uint64_t pts_ns) override;
 
   // Request a screenshot: the next decoded frame is written to
   // `<dir>/capture-WxH.nv12` as tightly-packed raw NV12 (w*h Y + w*h/2
   // interleaved UV), WxH being the frame's actual decoded size. The download
   // runs on the decode thread, where the VAAPI context is live. Convert with
   // e.g. ffmpeg -f rawvideo -pix_fmt nv12 -s WxH -i file.nv12 out.png
-  void request_capture(const char* dir);
+  void request_capture(const char* dir) override;
 
   // ── drm::scene::LayerBufferSource ──────────────────────────────────────────
   drm::expected<drm::scene::AcquiredBuffer, std::error_code> acquire() override;

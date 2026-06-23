@@ -48,10 +48,10 @@
 
 #include "audio_alsa.h"
 #include "config_env.h"
+#include "decoder_source.h"
 #include "dongle.h"
 #include "dongle_manager.h"
 #include "input_touch.h"
-#include "vaapi_decoder_source.h"
 
 namespace {
 std::atomic<bool> g_quit{false};
@@ -470,9 +470,9 @@ int main(int argc, char** argv) {
   }
   auto scene = std::move(*scene_r);
 
-  auto src = ck::VaapiDecoderSource::create(dev, vw, vh);
+  auto src = ck::create_decoder_source(dev, vw, vh);
   if (!src) {
-    std::fprintf(stderr, "VaapiDecoderSource::create failed\n");
+    std::fprintf(stderr, "no video decoder available\n");
     return 1;
   }
 
@@ -501,7 +501,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   auto* vsrc =
-      dynamic_cast<ck::VaapiDecoderSource*>(&scene->get_layer(*lh)->source());
+      dynamic_cast<ck::DecoderSource*>(&scene->get_layer(*lh)->source());
 
   // Audio: ALSA playback of the dongle PCM + on-demand mic capture. Devices are
   // overridable (e.g. CARLINKIT_AUDIO_DEV=plughw:1,3 for HDMI/monitor speakers
@@ -521,7 +521,7 @@ int main(int argc, char** argv) {
 
   ck::DongleSink sink;
   sink.on_video = [&](const ck::VideoFrame& f) {
-    vsrc->submit_bitstream(f.data, f.size);
+    vsrc->submit_bitstream(f.data, f.size, 0);
   };
   sink.on_audio = [&](const ck::AudioFrame& f) {
     audio_out.submit(f);  // PCM mixing + ducking handled by the mixer

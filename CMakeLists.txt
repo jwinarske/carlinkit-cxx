@@ -62,6 +62,7 @@ if(LIBAV_FOUND AND LIBVA_FOUND AND LIBDRM_FOUND AND EXISTS "${DRM_CXX_DIR}/CMake
 
   add_executable(carlinkit-kms
     src/main_kms.cpp
+    src/decoder_source.cpp
     src/vaapi_decoder.cpp
     src/vaapi_decoder_source.cpp
     src/audio_alsa.cpp

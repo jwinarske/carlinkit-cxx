@@ -418,6 +418,8 @@ void SoftwareDecoderSource::request_capture(const char* dir) {
     std::lock_guard<std::mutex> lk(m_);
     capture_dir_ = dir;
   }
+  // Publish capture_dir_ (under m_, above) before the flag: on_frame reads the
+  // flag, then re-takes m_ to read capture_dir_, so it always sees this dir.
   capture_req_ = true;  // serviced by the next on_frame (decode thread)
 }
 

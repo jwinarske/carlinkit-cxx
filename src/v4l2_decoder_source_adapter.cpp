@@ -36,7 +36,9 @@ bool is_h264_decoder(const char* path) {
                               : cap.capabilities;
     const bool mplane = (caps & V4L2_CAP_VIDEO_M2M_MPLANE) != 0U;
     if (mplane || (caps & V4L2_CAP_VIDEO_M2M) != 0U) {
-      for (uint32_t i = 0;; ++i) {
+      // Normally terminated by VIDIOC_ENUM_FMT failing past the last format;
+      // the index cap guards against a buggy driver that never reports EINVAL.
+      for (uint32_t i = 0; i < 256; ++i) {
         v4l2_fmtdesc desc{};
         desc.index = i;
         desc.type = mplane ? V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE
@@ -149,8 +151,12 @@ void V4l2DecoderSourceAdapter::submit_bitstream(const uint8_t* data,
       queue_.pop_front();  // decoder is behind; drop the oldest coded chunk
     queue_.emplace_back(data, data + len);
   }
+  // Nudge the pump. A failed write here is harmless: a full pipe means a wake
+  // is already pending (poll will fire), and even with no wake at all the pump
+  // re-checks the queue every poll timeout, so the chunk is picked up
+  // regardless.
   const char c = 1;
-  (void)!write(wake_w_, &c, 1);  // wake the pump to submit it
+  (void)!write(wake_w_, &c, 1);
 }
 
 void V4l2DecoderSourceAdapter::pump() {

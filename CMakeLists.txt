@@ -23,6 +23,7 @@ target_compile_options(carlinkit-probe PRIVATE -Wall -Wextra)
 # Headless verification of the libavcodec+VAAPI -> DRM-PRIME zero-copy decode
 # path (no DRM master needed). See docs/ARCHITECTURE.md.
 pkg_check_modules(LIBAV IMPORTED_TARGET libavcodec libavutil)
+pkg_check_modules(LIBSWS IMPORTED_TARGET libswscale)
 pkg_check_modules(LIBVA IMPORTED_TARGET libva libva-drm)
 pkg_check_modules(ALSA IMPORTED_TARGET alsa)
 pkg_check_modules(LIBDRM_DUMP IMPORTED_TARGET libdrm)
@@ -65,6 +66,7 @@ if(LIBAV_FOUND AND LIBVA_FOUND AND LIBDRM_FOUND AND EXISTS "${DRM_CXX_DIR}/CMake
     src/decoder_source.cpp
     src/vaapi_decoder.cpp
     src/vaapi_decoder_source.cpp
+    src/software_decoder_source.cpp
     src/audio_alsa.cpp
     src/usb_device.cpp
     src/dongle.cpp
@@ -72,8 +74,8 @@ if(LIBAV_FOUND AND LIBVA_FOUND AND LIBDRM_FOUND AND EXISTS "${DRM_CXX_DIR}/CMake
   )
   target_include_directories(carlinkit-kms PRIVATE ${DRM_CXX_DIR}/examples/common)
   target_link_libraries(carlinkit-kms PRIVATE
-    drm-cxx::drm-cxx PkgConfig::LIBAV PkgConfig::LIBVA PkgConfig::LIBDRM
-    PkgConfig::ALSA PkgConfig::LIBUSB Threads::Threads)
+    drm-cxx::drm-cxx PkgConfig::LIBAV PkgConfig::LIBSWS PkgConfig::LIBVA
+    PkgConfig::LIBDRM PkgConfig::ALSA PkgConfig::LIBUSB Threads::Threads)
   target_compile_options(carlinkit-kms PRIVATE -Wall -Wextra)
 else()
   message(STATUS "carlinkit-kms skipped (need libav, libva, libdrm, and drm-cxx at ${DRM_CXX_DIR})")

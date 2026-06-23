@@ -1,0 +1,4 @@
+[submodule "third_party/drm-cxx"]
+	path = third_party/drm-cxx
+	url = git@github.com:jwinarske/drm-cxx.git
+	branch = main

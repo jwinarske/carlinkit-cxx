@@ -48,9 +48,10 @@ if(LIBAV_FOUND AND LIBVA_FOUND)
   target_compile_options(carlinkit-decode-probe PRIVATE -Wall -Wextra)
 endif()
 
-# Stage 2b: KMS app — drm-cxx scene + HW plane, fed by the VAAPI decoder.
-# drm-cxx is consumed as a sibling source tree via add_subdirectory.
-set(DRM_CXX_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../drm-cxx" CACHE PATH "Path to drm-cxx source tree")
+# KMS app — drm-cxx scene + HW plane, fed by the decoder. drm-cxx is pinned as a
+# git submodule (third_party/drm-cxx) and consumed via add_subdirectory; override
+# DRM_CXX_DIR to build against a local working tree instead.
+set(DRM_CXX_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/drm-cxx" CACHE PATH "Path to drm-cxx source tree")
 pkg_check_modules(LIBDRM IMPORTED_TARGET libdrm)
 # Force the CPU-only decode path, omitting the VAAPI and V4L2 backends (and
 # their libva dependency) from the build to minimize code size. The runtime
@@ -65,6 +66,19 @@ if(LIBAV_FOUND AND LIBSWS_FOUND AND LIBDRM_FOUND AND EXISTS "${DRM_CXX_DIR}/CMak
   set(DRM_CXX_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   set(DRM_CXX_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
   set(DRM_CXX_INSTALL OFF CACHE BOOL "" FORCE)
+  # drm-cxx's vendored deps (tcb-span, tl-expected, fmt, ...) are meson wrap
+  # subprojects that are git-ignored in the submodule; provision them once if
+  # absent so the add_subdirectory build finds their headers.
+  if(NOT EXISTS "${DRM_CXX_DIR}/subprojects/tcb-span/include")
+    find_program(MESON_EXECUTABLE meson)
+    if(MESON_EXECUTABLE)
+      message(STATUS "drm-cxx: downloading meson subprojects via ${MESON_EXECUTABLE}")
+      execute_process(COMMAND ${MESON_EXECUTABLE} subprojects download
+                      WORKING_DIRECTORY ${DRM_CXX_DIR})
+    else()
+      message(WARNING "meson not found; run 'meson subprojects download' in ${DRM_CXX_DIR}")
+    endif()
+  endif()
   add_subdirectory(${DRM_CXX_DIR} ${CMAKE_BINARY_DIR}/drm-cxx-build)
 
   set(KMS_SOURCES
@@ -95,5 +109,5 @@ if(LIBAV_FOUND AND LIBSWS_FOUND AND LIBDRM_FOUND AND EXISTS "${DRM_CXX_DIR}/CMak
   endif()
   target_compile_options(carlinkit-kms PRIVATE -Wall -Wextra)
 else()
-  message(STATUS "carlinkit-kms skipped (need libav, libswscale, libdrm, drm-cxx at ${DRM_CXX_DIR}, and libva unless CARLINKIT_SOFTWARE_ONLY)")
+  message(STATUS "carlinkit-kms skipped (need libav, libswscale, libdrm, the drm-cxx submodule at ${DRM_CXX_DIR} — run 'git submodule update --init --recursive' — and libva unless CARLINKIT_SOFTWARE_ONLY)")
 endif()

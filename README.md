@@ -7,8 +7,8 @@ A C++/libusb receiver for Carlinkit **"Auto Box" CarPlay/Android Auto dongles**
 
 
 ```
-dongle ──USB bulk──► libusb async DMA ring ──► H.264 ──► HW decode (VAAPI / V4L2 M2M)
-                                                            │ NV12 DMA-BUF (zero-copy)
+dongle ──USB bulk──► libusb async DMA ring ──► H.264 ──► decode (VAAPI ▸ V4L2 M2M ▸ CPU)
+                                                            │ NV12 (DMA-BUF; CPU copy on the software path)
                                                             ▼
                                               drm-cxx scene ──► HW overlay plane (KMS)
 ```
@@ -16,23 +16,36 @@ dongle ──USB bulk──► libusb async DMA ring ──► H.264 ──► H
 The phone connects to the dongle **wirelessly** (Wi-Fi + Bluetooth); nothing is
 plugged into the dongle. See `docs/ARCHITECTURE.md` for the full design.
 
-## Targets
+## Decode paths
 
-- **Desktop (dev):** H.264 decode via **libavcodec + VAAPI** → NV12 DMA-BUF.
-- **Embedded (deploy):** Rockchip / other SoC via drm-cxx **`V4l2DecoderSource`**
-  (stateful V4L2 M2M decoder, no GStreamer).
+H.264 from the dongle is decoded by one of three interchangeable backends (each
+a `ck::DecoderSource` producing NV12 for the same KMS plane):
 
-The decoder code is portable; on distros with full ffmpeg (SteamOS/Arch, etc.)
-it works out of the box. **Fedora needs two package swaps — see below.**
+| Backend | When | How |
+|---------|------|-----|
+| **`vaapi`** | desktop / dev | libavcodec + VAAPI hwaccel → vendor-tiled NV12 **DMA-BUF**, scanned out zero-copy. |
+| **`v4l2`** | embedded SoC (Rockchip, …) | drm-cxx's stateful V4L2 M2M decoder → NV12 DMA-BUF, no GStreamer. |
+| **`software`** | anywhere (last resort) | libavcodec CPU decode + libswscale → NV12 in a DRM **dumb buffer**. Always works, but slow — prints a loud warning. |
+
+`CARLINKIT_DECODER` picks the backend (`vaapi` / `v4l2` / `software` / `auto`,
+default `auto`). **`auto` is the fallback chain: it tries VAAPI, then V4L2, then
+software, and uses the first that opens.** Naming a specific backend pins it — if
+that one fails to open, it's an error rather than a silent fall-through, so you
+always know what you're running. Display rotation (`CARLINKIT_ROTATE`) is honored
+on every path: VAAPI/V4L2 rotate on the HW plane, software rotates on the CPU.
+
+Build with `-DCARLINKIT_SOFTWARE_ONLY=ON` to compile **only** the software
+backend (drops the VAAPI/V4L2 sources and the libva link, for a smaller CPU-only
+build). On distros with full ffmpeg (SteamOS/Arch, etc.) VAAPI works out of the
+box; **Fedora needs two package swaps for hardware decode — see below.**
 
 ## ⚠️ Fedora setup (important)
 
 Fedora ships Mesa **and** ffmpeg with the patent-encumbered H.264/H.265 codecs
-**removed**. Both must be restored or hardware H.264 decode silently fails (Mesa
-won't expose the VA decoder; libavcodec won't expose the VAAPI hwaccel and
-**falls back to software** — symptom: `vaExportSurfaceHandle` returns
-`invalid VASurfaceID (0x6)` because the frame is software YUV420P, not a VAAPI
-surface).
+**removed**. Without the swaps below the VAAPI backend can't open (Mesa exposes no
+VA decoder; libavcodec exposes no VAAPI hwaccel), so `auto` falls through to the
+**software** backend: you still get a picture, but it is CPU-decoded and slow,
+with a loud `SOFTWARE DECODE WARNING`. Restore both for zero-copy hardware decode.
 
 ```bash
 # 1. Enable RPM Fusion (free is enough for both fixes)
@@ -55,23 +68,32 @@ from `libva-utils`. Non-Fedora distros with full ffmpeg/Mesa can skip all of thi
 
 ## Build dependencies
 
-- `cmake`, a **C++17** compiler (C++17 to match drm-cxx's ABI — C++20 selects
-  `std::span` and mismatches drm-cxx's `tcb::span` symbols)
+- `cmake` and `meson` (meson provisions drm-cxx's vendored deps), a **C++17**
+  compiler (C++17 to match drm-cxx's ABI — C++20 selects `std::span` and
+  mismatches drm-cxx's `tcb::span` symbols)
 - `libusb-1.0` (`libusb1-devel`)
-- `libavcodec` + `libavutil` (`libavcodec-free-devel` — headers live in
-  `/usr/include/ffmpeg`) and `libva` + `libva-drm` (`libva-devel`) for the
-  VAAPI decode probe / desktop video path
-- KMS app: **`drm-cxx`** (sibling source tree, consumed via `add_subdirectory`
-  at `../drm-cxx`), `libdrm`, `libva`, and ALSA (`alsa-lib-devel`)
+- `libavcodec` + `libavutil` + `libswscale` (`libavcodec-free-devel`,
+  `libswscale-free-devel` — headers live in `/usr/include/ffmpeg`) for H.264
+  decode and NV12 conversion; `libva` + `libva-drm` (`libva-devel`) for the VAAPI
+  path
+- KMS app: the **`drm-cxx`** git submodule at `third_party/drm-cxx` (pinned for
+  reproducible builds; override with `-DDRM_CXX_DIR=/path` to build against a
+  local working tree), `libdrm`, `libva` (unless `-DCARLINKIT_SOFTWARE_ONLY=ON`),
+  and ALSA (`alsa-lib-devel`)
 
 ```bash
-cmake -S . -B build && cmake --build build
+git submodule update --init --recursive    # fetch the drm-cxx submodule
+cmake -S . -B build && cmake --build build  # configure provisions drm-cxx's meson subprojects
+
+# CPU-only build (omits VAAPI/V4L2 and the libva link):
+cmake -S . -B build -DCARLINKIT_SOFTWARE_ONLY=ON && cmake --build build
 ```
 
 Targets: `carlinkit-probe` (headless capture), `carlinkit-decode-probe` (decode
 check), `carlinkit-audio` (headless audio), `carlinkit-drm-dump` (DRM plane/mode
 topology), and `carlinkit-kms` (the full head unit). The KMS app is built only
-when `drm-cxx` + libva + libdrm are found.
+when `drm-cxx` + libswscale + libdrm are found (plus libva, unless
+`CARLINKIT_SOFTWARE_ONLY`).
 
 ## USB access (run without root)
 
@@ -135,6 +157,9 @@ Environment overrides:
 | `CARLINKIT_CONNECTOR=DP-1` | Target a specific display (e.g. `HDMI-A-1`, `DP-1`) |
 | `DRM_FORCE_MODE=2560x1440` | Force a specific mode on the connector |
 | `CARLINKIT_CRTC=<id>` | Force a CRTC (debug; see `carlinkit-drm-dump`) |
+| `CARLINKIT_DECODER=auto` | Decode backend: `vaapi`/`v4l2`/`software`/`auto` (default `auto` = VAAPI ▸ V4L2 ▸ software). A named backend that can't open is a fatal error, not a fall-through |
+| `CARLINKIT_V4L2_DEV=/dev/video0` | V4L2 decoder node; default = scan `/dev/video*` for an H.264 M2M decoder |
+| `CARLINKIT_ROTATE=90` | Rotate the video `90`/`180`/`270°` (HW plane for VAAPI/V4L2, CPU convert for software) |
 | `CARLINKIT_RESOLUTION=1280x720` | CarPlay/box resolution; default = the DRM mode (1:1, no scaling) |
 | `CARLINKIT_AA_RESOLUTION=1280x720` | Android Auto canvas; default = the box resolution |
 | `CARLINKIT_FPS=60` | Frame rate; default = the mode's refresh rate, capped at 60 |
@@ -153,6 +178,8 @@ Environment overrides:
 | `CARLINKIT_MIC_DEV=plughw:2,0` | ALSA capture device for Siri / calls (default `default`) |
 | `CARLINKIT_OEM_ICON=assets/logo.png` | PNG to set as the dongle's own launcher tile (sent on connect); unset = leave the dongle's default |
 | `CARLINKIT_OEM_LABEL="carlinkit-cxx"` | Optional caption shown under the OEM icon |
+| `CARLINKIT_CAPTURE_DIR=.` | Directory where `SIGUSR1` writes a raw NV12 screenshot of the current frame (default `.`) |
+| `CARLINKIT_AUDIO_TRACE=1` | Debug: log the audio mixer's per-stream routing/ducking decisions |
 
 > **Known issue:** on some AMD multi-display setups, drm-cxx's allocator rejects
 > the decoder's tiled-NV12 modifier on one pipe (e.g. `DP-1`) even though the
@@ -209,8 +236,11 @@ input — a webcam or USB mic — when you want Siri / phone calls.
 ## Status
 
 - ✅ USB protocol + async DMA-ring receiver (`carlinkit-probe`)
+- ✅ Decode backend chain (VAAPI ▸ V4L2 ▸ software) via `CARLINKIT_DECODER`
 - ✅ libavcodec+VAAPI H.264 → zero-copy NV12 DMA-BUF (`carlinkit-decode-probe`)
+- ✅ Software (CPU) H.264 → NV12 dumb-buffer fallback (`CARLINKIT_DECODER=software`)
 - ✅ drm-cxx KMS video sink on a HW plane (`carlinkit-kms`) — aspect-fit, native mode
+- ✅ Display rotation on every path (HW plane for VAAPI/V4L2, CPU for software)
 - ✅ ALSA audio out + mic; touch + mouse cursor input
 - ✅ Hotplug / surprise-removal (auto-reconnect)
-- 🚧 Embedded SoC `V4l2DecoderSource` path; DP-1 plane-allocation fix
+- 🚧 Embedded SoC `V4l2DecoderSource` path (builds; untested on hardware) + DP-1 plane-allocation fix

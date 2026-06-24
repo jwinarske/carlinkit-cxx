@@ -103,7 +103,7 @@ when `drm-cxx` + libswscale + libdrm are found (plus libva, unless
 ## Cross-compiling for Raspberry Pi (emb)
 
 `carlinkit-kms` cross-compiles for 64-bit Raspberry Pi OS with
-[emb](https://github.com/jwinarske/emb_cli) using the manifests in `.emb/`. The
+[emb](https://github.com/toyota-connected/emb_cli) using the manifests in `.emb/`. The
 decode path is set per board to match the silicon: **Pi 5** is software-only (no
 hardware H.264 decoder), **Pi 4** uses the V4L2 hardware decoder. Targets:
 `rpi5-trixie`, `rpi5-bookworm`, `rpi4-trixie`, `rpi4-bookworm`.

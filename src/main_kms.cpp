@@ -16,6 +16,7 @@
 #include <unistd.h>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <csignal>
 #include <cstdio>
@@ -535,9 +536,15 @@ int main(int argc, char** argv) {
                          mgr->send(ck::send_audio(pcm, n));
                      });
 
+  // Optional frame-rate profiling (CARLINKIT_FPS_LOG=1): `video` counts decoded
+  // frames the dongle delivers; `display` counts page flips (vsync-bound).
+  const bool fps_log = std::getenv("CARLINKIT_FPS_LOG") != nullptr;
+  std::atomic<uint32_t> vframe_count{0};
+
   ck::DongleSink sink;
   sink.on_video = [&](const ck::VideoFrame& f) {
     vsrc->submit_bitstream(f.data, f.size, 0);
+    vframe_count.fetch_add(1, std::memory_order_relaxed);
   };
   sink.on_audio = [&](const ck::AudioFrame& f) {
     audio_out.submit(f);  // PCM mixing + ducking handled by the mixer
@@ -655,9 +662,13 @@ int main(int argc, char** argv) {
   }
 
   std::atomic<bool> flip_pending{false};
+  uint32_t flip_count =
+      0;  // page flips since the last fps report (main thread)
   drm::PageFlip page_flip(dev);
-  page_flip.set_handler(
-      [&](uint32_t, uint64_t, uint64_t) { flip_pending = false; });
+  page_flip.set_handler([&](uint32_t, uint64_t, uint64_t) {
+    flip_pending = false;
+    ++flip_count;
+  });
 
   if (auto r = scene->commit(DRM_MODE_PAGE_FLIP_EVENT, &page_flip); !r) {
     std::fprintf(stderr, "first commit: %s\n", r.error().message().c_str());
@@ -744,21 +755,67 @@ int main(int argc, char** argv) {
   const char* capture_dir = std::getenv("CARLINKIT_CAPTURE_DIR");
   if (capture_dir == nullptr)
     capture_dir = ".";
+  auto fps_t0 = std::chrono::steady_clock::now();
+  // Per-window timing (CARLINKIT_FPS_LOG): where does each frame's time go —
+  // blocking in scene->commit(), or waiting for the flip event in poll()?
+  double commit_us_sum = 0, commit_us_max = 0, poll_us_sum = 0, poll_us_max = 0;
+  uint32_t commit_n = 0;
+  const auto us_since = [](std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration<double, std::micro>(
+               std::chrono::steady_clock::now() - t)
+        .count();
+  };
   while (!g_quit && !mapper.quit()) {
     if (g_capture.exchange(false) && vsrc != nullptr)
       vsrc->request_capture(capture_dir);  // written by the next decoded frame
     pollfd p{dev.fd(), POLLIN, 0};
+    const auto poll_t0 = std::chrono::steady_clock::now();
     if (::poll(&p, 1, flip_pending ? 100 : 8) > 0 && (p.revents & POLLIN))
       (void)page_flip.dispatch(0);
+    if (fps_log) {
+      const double us = us_since(poll_t0);
+      poll_us_sum += us;
+      poll_us_max = std::max(poll_us_max, us);
+    }
     if (cursor && mapper.take_cursor_dirty())
       (void)cursor->move_to(mapper.cursor_x(), mapper.cursor_y());
     if (!flip_pending) {
-      auto r = scene->commit(DRM_MODE_PAGE_FLIP_EVENT, &page_flip);
+      const auto commit_t0 = std::chrono::steady_clock::now();
+      // Non-blocking: submit the flip and return immediately rather than block
+      // ~one vblank inside the ioctl. The page-flip event (polled above) drives
+      // the next commit, so the loop isn't gated by the commit's duration — the
+      // kernel paces the flip to vblank. (The first commit, which modesets,
+      // stays blocking — async modeset isn't allowed.)
+      auto r = scene->commit(
+          DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK, &page_flip);
+      if (fps_log) {
+        const double us = us_since(commit_t0);
+        commit_us_sum += us;
+        commit_us_max = std::max(commit_us_max, us);
+        ++commit_n;
+      }
       if (!r) {
         std::fprintf(stderr, "commit: %s\n", r.error().message().c_str());
         break;
       }
       flip_pending = true;
+    }
+    if (fps_log) {
+      const auto now = std::chrono::steady_clock::now();
+      const double secs = std::chrono::duration<double>(now - fps_t0).count();
+      if (secs >= 1.0) {
+        const double cn = commit_n > 0 ? commit_n : 1;
+        std::fprintf(stderr,
+                     "[fps] video=%.1f display=%.1f | commit avg=%.0f max=%.0f "
+                     "| poll avg=%.0f max=%.0f us\n",
+                     vframe_count.exchange(0) / secs, flip_count / secs,
+                     commit_us_sum / cn, commit_us_max, poll_us_sum / cn,
+                     poll_us_max);
+        flip_count = 0;
+        fps_t0 = now;
+        commit_us_sum = commit_us_max = poll_us_sum = poll_us_max = 0;
+        commit_n = 0;
+      }
     }
   }
 

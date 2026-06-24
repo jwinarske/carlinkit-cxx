@@ -39,6 +39,11 @@ backend (drops the VAAPI/V4L2 sources and the libva link, for a smaller CPU-only
 build). On distros with full ffmpeg (SteamOS/Arch, etc.) VAAPI works out of the
 box; **Fedora needs two package swaps for hardware decode — see below.**
 
+On the Raspberry Pi the backend follows the silicon: **Pi 5** has no hardware
+H.264 decoder, so it uses `software`; **Pi 4**'s VideoCore VI has a V4L2 stateful
+decoder, so it uses `v4l2`. The `.emb/` manifests set this per board — see
+[Cross-compiling for Raspberry Pi](#cross-compiling-for-raspberry-pi-emb).
+
 ## ⚠️ Fedora setup (important)
 
 Fedora ships Mesa **and** ffmpeg with the patent-encumbered H.264/H.265 codecs
@@ -94,6 +99,55 @@ check), `carlinkit-audio` (headless audio), `carlinkit-drm-dump` (DRM plane/mode
 topology), and `carlinkit-kms` (the full head unit). The KMS app is built only
 when `drm-cxx` + libswscale + libdrm are found (plus libva, unless
 `CARLINKIT_SOFTWARE_ONLY`).
+
+## Cross-compiling for Raspberry Pi (emb)
+
+`carlinkit-kms` cross-compiles for 64-bit Raspberry Pi OS with
+[emb](https://github.com/jwinarske/emb_cli) using the manifests in `.emb/`. The
+decode path is set per board to match the silicon: **Pi 5** is software-only (no
+hardware H.264 decoder), **Pi 4** uses the V4L2 hardware decoder. Targets:
+`rpi5-trixie`, `rpi5-bookworm`, `rpi4-trixie`, `rpi4-bookworm`.
+
+```bash
+# one-time: install the emb CLI and put it (and its Dart SDK) on PATH
+eval "$(../emb_cli/bootstrap.sh --shellenv)"
+
+git submodule update --init --recursive          # drm-cxx + its Vulkan-Headers
+emb cross . --list-targets                        # show the Pi targets
+
+# build carlinkit-kms and package a .deb for the Pi 5 (trixie):
+emb cross . --target rpi5-trixie --build --deb
+#  -> .config/.../dist/carlinkit-cxx_0.1.0_arm64.deb  (Depends auto-derived)
+```
+
+emb downloads the ARM GNU toolchain and the PiOS image, stages a sysroot from the
+manifest's `dev_packages`, and builds drm-cxx + carlinkit against it (the large
+toolchain/sysroot/build output lands under the git-ignored `.config/`).
+
+Deploy + install on the Pi (emb's own `--deploy` is for Flutter bundles, so scp
+this plain binary):
+
+```bash
+scp .config/.../dist/carlinkit-cxx_0.1.0_arm64.deb pi@raspberrypi.local:
+ssh pi@raspberrypi.local 'sudo apt install -y ./carlinkit-cxx_0.1.0_arm64.deb'
+```
+
+Then install the dongle [udev rule](#usb-access-run-without-root) and run on a
+console VT (Pi OS Lite has no compositor holding DRM master):
+
+```bash
+CARLINKIT_AUDIO_DEV=plughw:0,0 carlinkit-kms /dev/dri/card0 --no-seat
+```
+
+**Pi 5 notes.** Software decode of the dongle's native size (e.g. 1280x1440) can
+saturate the CPU and crackle the audio; drop the CarPlay size with
+`CARLINKIT_RESOLUTION=1280x800` (or `1280x720`) — at 800p the Pi 5 has ample
+headroom (~18% CPU, 59 °C, no throttling). There is no microphone on the Pi, so
+Siri / phone-call input needs a USB mic (`CARLINKIT_MIC_DEV`); HDMI audio output
+works as-is. `CARLINKIT_FPS_LOG=1` logs the decode and display frame rates plus
+the present timing. The display holds 60 fps on calm content but dips during
+decode bursts — that residual is the vc4 KMS present path (flipping a scaled NV12
+plane), not the render loop, which already commits non-blocking.
 
 ## USB access (run without root)
 
@@ -243,4 +297,6 @@ input — a webcam or USB mic — when you want Siri / phone calls.
 - ✅ Display rotation on every path (HW plane for VAAPI/V4L2, CPU for software)
 - ✅ ALSA audio out + mic; touch + mouse cursor input
 - ✅ Hotplug / surprise-removal (auto-reconnect)
-- 🚧 Embedded SoC `V4l2DecoderSource` path (builds; untested on hardware) + DP-1 plane-allocation fix
+- ✅ Non-blocking present (`DRM_MODE_ATOMIC_NONBLOCK`) + `CARLINKIT_FPS_LOG` profiling
+- ✅ Raspberry Pi 5 cross-compile via emb (`.emb/`) — validated end-to-end on hardware (software decode, HDMI audio, CarPlay)
+- 🚧 Raspberry Pi 4 V4L2 hardware-decode path (builds; needs Pi 4 hardware to verify) + DP-1 plane-allocation fix

@@ -139,24 +139,67 @@ console VT (Pi OS Lite has no compositor holding DRM master):
 CARLINKIT_AUDIO_DEV=plughw:0,0 carlinkit-kms /dev/dri/card0 --no-seat
 ```
 
-**Pi 5 notes.** Software decode of the dongle's native size (e.g. 1280x1440) can
-saturate the CPU and crackle the audio; drop the CarPlay size with
-`CARLINKIT_RESOLUTION=1280x800` (or `1280x720`) — at 800p the Pi 5 has ample
-headroom (~18% CPU, 59 °C, no throttling). There is no microphone on the Pi, so
-Siri / phone-call input needs a USB mic (`CARLINKIT_MIC_DEV`); HDMI audio output
-works as-is. `CARLINKIT_FPS_LOG=1` logs the decode and display frame rates plus
-the present timing. The display holds 60 fps on calm content but dips during
-decode bursts — that residual is the vc4 KMS present path (flipping a scaled NV12
-plane), not the render loop, which already commits non-blocking.
+### Decode performance — Pi 4 vs Pi 5
+
+The two boards take opposite paths: the **Pi 4** offloads H.264 to its VideoCore
+hardware decoder (V4L2), while the **Pi 5** — which has no video-decode block —
+decodes on the Cortex-A76 cores. Measured running live CarPlay at 1280x800
+(`carlinkit-kms` process %CPU from `top`, of 400% = 4 cores):
+
+|                      | Pi 4 — V4L2 HW decode          | Pi 5 — software decode      |
+| -------------------- | ------------------------------ | --------------------------- |
+| Decoder              | bcm2835-codec (`/dev/video10`) | libavcodec on the A76 cores |
+| `carlinkit-kms` CPU  | ~6-10% of 4 cores              | ~15-20% of 4 cores          |
+| SoC clock under load | stays at 600 MHz (idle)        | ramps to 2.4 GHz            |
+| SoC temperature      | ~44 °C                         | ~54 °C                      |
+| Display scanout      | 40-60 fps                      | 30-40 fps                   |
+
+The Pi 4 barely touches the CPU — the decode runs in fixed-function hardware, so
+the cores never leave their 600 MHz idle clock and the board stays cool. The Pi 5
+does the same work on the CPU: it copes easily at 800p (the fast A76 ramps to full
+clock), but the dongle's native 1280x1440 saturates it and crackles the audio, so
+keep `CARLINKIT_RESOLUTION=1280x800` (or `1280x720`). Neither board pins a hard
+60 fps — the residual is the vc4 KMS present path flipping a scaled NV12 plane,
+not the render loop, which already commits non-blocking. There is no microphone
+on either Pi, so Siri / phone-call input needs a USB mic (`CARLINKIT_MIC_DEV`);
+HDMI audio output works as-is.
+
+**Replicating the measurement.** On a console VT (no compositor) with the dongle
+plugged and your phone paired:
+
+```bash
+# terminal 1: run CarPlay with decode/display fps + present timing logged
+CARLINKIT_FPS_LOG=1 CARLINKIT_RESOLUTION=1280x800 \
+  carlinkit-kms /dev/dri/card0 --no-seat
+
+# terminal 2: process CPU (of 400% = 4 cores), SoC clock, and temperature
+top -b -d 2 -p "$(pgrep -n carlinkit-kms)" | grep carlinkit-kms
+vcgencmd measure_clock arm     # ~600 MHz (Pi 4, HW) vs ~2.4 GHz (Pi 5, SW)
+vcgencmd measure_temp
+```
+
+`decoder:` at startup confirms the active path — `V4L2 (SoC HW decoder)` on the
+Pi 4, `software (CPU H.264 -> NV12 dumb buffer)` on the Pi 5. The `[fps]` lines
+report `video=` (the dongle's on-demand decode rate, which tracks what the phone
+is drawing) and `display=` (KMS scanout).
 
 ## USB access (run without root)
 
 The dongle's USB node is root-only by default. Install the udev rule for
-non-root access (and so access survives the dongle re-enumerating):
+non-root access (and so access survives the dongle re-enumerating) — either with
+the helper, which re-execs itself with sudo and adds you to the rule's `dialout`
+group:
+
+```bash
+./scripts/install-udev-rule.sh
+```
+
+or by hand:
 
 ```bash
 sudo cp scripts/99-carlinkit.rules /etc/udev/rules.d/
 sudo udevadm control --reload && sudo udevadm trigger --attr-match=idVendor=1314
+sudo usermod -aG dialout "$USER"      # then re-login
 ```
 
 The dongle also exposes a small USB mass-storage partition that auto-mounts at
@@ -299,4 +342,4 @@ input — a webcam or USB mic — when you want Siri / phone calls.
 - ✅ Hotplug / surprise-removal (auto-reconnect)
 - ✅ Non-blocking present (`DRM_MODE_ATOMIC_NONBLOCK`) + `CARLINKIT_FPS_LOG` profiling
 - ✅ Raspberry Pi 5 cross-compile via emb (`.emb/`) — validated end-to-end on hardware (software decode, HDMI audio, CarPlay)
-- 🚧 Raspberry Pi 4 V4L2 hardware-decode path (builds; needs Pi 4 hardware to verify) + DP-1 plane-allocation fix
+- ✅ Raspberry Pi 4 V4L2 hardware-decode path — validated end-to-end on hardware (bcm2835-codec → zero-copy KMS, dongle + CarPlay; ~6-10% CPU at 600 MHz). DP-1 plane allocation still to fix.

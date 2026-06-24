@@ -1,0 +1,29 @@
+# Shared base for the carlinkit-cxx board manifests in this .emb/ directory.
+#
+# emb (emb_cli) auto-discovers `.emb/` when you run `emb cross` from the project
+# root and deep-merges each <board>.emb.yaml over this base. Build from the repo
+# root (the directory that holds CMakeLists.txt), which is what emb uses as the
+# CMake source:
+#
+#   emb cross . --list-targets
+#   emb cross . --target rpi5-trixie --build         # cross-build carlinkit-kms
+#   emb cross . --target rpi5-trixie --build --deb   # ... and package a .deb
+#   emb cross . --build                              # native host build
+#
+# `base.emb.yaml` is the reserved base filename and is never itself a target.
+id: carlinkit-cxx
+type: app
+supported_archs: [arm64, x86_64]
+supported_host_types: [fedora, ubuntu]
+
+cross:
+  # `provider` is required only to parse this block; it is ignored for the
+  # native (`--target local`, the default) build, which uses the host toolchain.
+  # Every board target overrides it with its own provider.
+  provider: arm-gnu
+  # carlinkit builds a single binary (`carlinkit-kms`); the decode backend
+  # (VAAPI / V4L2 / software) is selected at runtime via CARLINKIT_DECODER, not
+  # at build time. So there is one build entry, not a backend matrix.
+  backends:
+    kms:
+      CARLINKIT_SOFTWARE_ONLY: 'OFF'

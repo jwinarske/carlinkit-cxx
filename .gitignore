@@ -7,3 +7,8 @@ compile_commands.json
 /reference/
 /out.h264
 /out.pcm
+
+# emb cross-compile output (downloaded toolchain + PiOS sysroot + build dirs)
+/.config/
+/build-sub/
+/build-clean/

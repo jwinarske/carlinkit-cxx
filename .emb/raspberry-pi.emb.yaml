@@ -1,0 +1,101 @@
+# carlinkit-cxx on Raspberry Pi (PiOS aarch64) — the project layer.
+#
+# Hardware/OS facts (toolchain, sysroot image, partition, cpu tuning, base
+# DRM/input/EGL/Vulkan stack) come from emb's shipped board library
+# (boards/raspberry-pi.emb.yaml); each target `extends` a board and overlays
+# carlinkit's extra packages and CMake config:
+#
+#   emb cross raspberry-pi.emb.yaml --list-targets
+#   emb cross raspberry-pi.emb.yaml --target rpi5-trixie --build --deb
+#
+# Decode path is chosen per board to match the silicon:
+#   * Pi 5 has NO hardware H.264 decoder (Broadcom dropped the VideoCore decode
+#     block; the A76 decodes on the CPU), so rpi5 builds CARLINKIT_SOFTWARE_ONLY
+#     — software decode only, and no libva.
+#   * Pi 4's VideoCore VI has the V4L2 stateful H.264 decoder, so rpi4 builds the
+#     full path (V4L2 hardware decode, with software as the fallback). The VAAPI
+#     backend is also compiled (libva is a link-time dep) but never opens on the
+#     Pi; CARLINKIT_DECODER=auto lands on V4L2.
+#
+# drm-cxx (a submodule at third_party/drm-cxx) needs libdisplay-info >= 0.2.0:
+# trixie ships it; bookworm cross-builds 0.2.0 from source.
+id: carlinkit-cxx
+type: app
+supported_archs: [arm64]
+supported_host_types: [ubuntu, fedora]
+
+build:
+  app_path: .
+  archs: [arm64]
+  modes: [release]
+  output: bundles
+
+cross:
+  package:
+    name: carlinkit-cxx
+    version: 0.1.0
+    maintainer: "Joel Winarske <joel.winarske@linux.com>"
+    description: "Carlinkit CarPlay/Android Auto USB receiver, cross-built by emb"
+    section: utils
+    bin: carlinkit-kms          # relative to each backend build dir
+    install_dir: /usr/bin
+
+  targets:
+    # -- Raspberry Pi 5 (Cortex-A76) — software decode only (no HW H.264) --
+    rpi5-trixie:
+      extends: rpi5-trixie
+      sysroot:
+        dev_packages:
+          - libavcodec-dev
+          - libavutil-dev
+          - libswscale-dev
+          - libasound2-dev
+          - libusb-1.0-0-dev
+          - libdisplay-info-dev   # trixie ships >= 0.2.0
+      backends: &backends_software
+        kms:
+          CARLINKIT_SOFTWARE_ONLY: 'ON'
+    rpi5-bookworm:
+      extends: rpi5-bookworm
+      sysroot:
+        dev_packages:
+          - libavcodec-dev
+          - libavutil-dev
+          - libswscale-dev
+          - libasound2-dev
+          - libusb-1.0-0-dev
+      augment: &augment_libdisplayinfo
+        - pkg: libdisplay-info
+          min: "0.2.0"
+          url: https://gitlab.freedesktop.org/emersion/libdisplay-info/-/archive/0.2.0/libdisplay-info-0.2.0.tar.gz
+          build: meson
+          static: true
+      backends: *backends_software
+
+    # -- Raspberry Pi 4 (Cortex-A72) — V4L2 hardware decode path -----------
+    rpi4-trixie:
+      extends: rpi4-trixie
+      sysroot:
+        dev_packages:
+          - libavcodec-dev
+          - libavutil-dev
+          - libswscale-dev
+          - libva-dev             # VAAPI backend compiles (inert on the Pi)
+          - libasound2-dev
+          - libusb-1.0-0-dev
+          - libdisplay-info-dev
+      backends: &backends_hw
+        kms:
+          CARLINKIT_SOFTWARE_ONLY: 'OFF'
+    rpi4-bookworm:
+      extends: rpi4-bookworm
+      sysroot:
+        dev_packages:
+          - libavcodec-dev
+          - libavutil-dev
+          - libswscale-dev
+          - libva-dev
+          - libasound2-dev
+          - libusb-1.0-0-dev
+      augment: *augment_libdisplayinfo
+      backends: *backends_hw

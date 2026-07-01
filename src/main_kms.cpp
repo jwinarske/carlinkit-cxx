@@ -430,11 +430,12 @@ int main(int argc, char** argv) {
                dcfg.fps, dcfg.dpi, dcfg.aaWidth != 0 ? dcfg.aaWidth : vw,
                dcfg.aaHeight != 0 ? dcfg.aaHeight : vh);
 
-  // Optional display rotation (CARLINKIT_ROTATE=90|180|270). How it is realized
-  // depends on the decode backend, decided once the source exists (below): the
-  // software backend bakes rotation into its CPU convert and presents an
-  // already-oriented buffer; VAAPI/V4L2 rotate their tiled buffer on the HW
-  // plane.
+  // Optional display rotation (CARLINKIT_ROTATE=90|180|270). Prefer the HW
+  // plane: if an NV12 plane on this CRTC advertises the requested angle the
+  // plane rotates the scanned-out buffer for free and the source stays
+  // unrotated; only when no plane can does the software backend bake rotation
+  // into its CPU convert (VAAPI/V4L2 never bake -- they rotate on a plane or
+  // not at all). The plane query needs the scene, so the decision lands below.
   const uint64_t rot = requested_rotation();
 
   drm::scene::LayerScene::Config cfg;
@@ -449,7 +450,16 @@ int main(int argc, char** argv) {
   }
   auto scene = std::move(*scene_r);
 
-  auto src = ck::create_decoder_source(dev, vw, vh, rot);
+  // Ask the scene which rotations an NV12 plane on this CRTC supports and give
+  // the source only the residual the plane can't do. When a plane covers the
+  // angle, sw_rot is 0: the software source skips its CPU rotate and the plane
+  // rotates zero-copy; the allocator binds only a plane that supports the
+  // angle.
+  const uint64_t plane_can_do = scene->candidate_rotation(DRM_FORMAT_NV12);
+  const bool plane_can_rot = rot != 0 && (plane_can_do & rot) == rot;
+  const uint64_t sw_rot = plane_can_rot ? 0 : rot;
+
+  auto src = ck::create_decoder_source(dev, vw, vh, sw_rot);
   if (!src) {
     std::fprintf(stderr, "no video decoder available\n");
     return 1;
@@ -471,8 +481,7 @@ int main(int argc, char** argv) {
     if (applied != 0) {
       std::fprintf(stderr, "rotating video %u degrees in software (CPU)\n",
                    deg);
-    } else if ((connector_rotation_caps(dev.fd(), out->connector_id) & rot) !=
-               0) {
+    } else if (plane_can_rot) {
       std::fprintf(stderr, "rotating video %u degrees on the HW plane\n", deg);
     } else {
       std::fprintf(

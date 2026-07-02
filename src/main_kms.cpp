@@ -815,7 +815,12 @@ int main(int argc, char** argv) {
     }
     if (cursor && mapper.take_cursor_dirty())
       (void)cursor->move_to(mapper.cursor_x(), mapper.cursor_y());
-    if (!flip_pending) {
+    // Skip the flip when the source has no new frame: the panel keeps scanning
+    // out the current buffer, so a static screen costs no commits. The GPU
+    // rotate path reports staleness via has_fresh_content(); the other backends
+    // report fresh unconditionally (default), so their cadence is unchanged.
+    // Single video layer, so the source's freshness is the scene's.
+    if (!flip_pending && vsrc->has_fresh_content()) {
       const auto commit_t0 = std::chrono::steady_clock::now();
       // Non-blocking: submit the flip and return immediately rather than block
       // ~one vblank inside the ioctl. The page-flip event (polled above) drives

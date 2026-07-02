@@ -97,6 +97,7 @@ class GlRotateSource : public DecoderSource {
   int loc_rot_ = -1;
   bool gl_ready_ = false;
   bool rendered_once_ = false;  // the producer's front buffer has valid content
+  uint64_t last_seq_ = 0;  // inner gpu_frame_seq of the frame last rendered
 };
 
 }  // namespace ck

@@ -60,11 +60,17 @@ std::unique_ptr<DecoderSource> make_software(drm::Device& dev,
 
 }  // namespace
 
-std::unique_ptr<DecoderSource> create_decoder_source(drm::Device& dev,
-                                                     uint32_t coded_w,
-                                                     uint32_t coded_h,
-                                                     uint64_t rot) {
-  const DecoderBackend pref = parse_pref();
+DecoderBackend decoder_preference() {
+  return parse_pref();
+}
+
+std::unique_ptr<DecoderSource> create_decoder_source(
+    drm::Device& dev,
+    uint32_t coded_w,
+    uint32_t coded_h,
+    uint64_t rot,
+    std::optional<DecoderBackend> force) {
+  const DecoderBackend pref = force.value_or(parse_pref());
 
 #ifdef CARLINKIT_SOFTWARE_ONLY
   if (pref != DecoderBackend::Auto && pref != DecoderBackend::Software)

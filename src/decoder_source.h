@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 
 namespace drm {
 class Device;
@@ -94,17 +95,25 @@ class DecoderSource : public drm::scene::LayerBufferSource {
 // that fails to open is an error, not a fall-through).
 enum class DecoderBackend { Auto, Vaapi, V4l2, Software };
 
-// Build the video-decode source. The backend is chosen by CARLINKIT_DECODER
-// (vaapi|v4l2|software|auto, default auto); Auto tries VAAPI, then V4L2, then
-// software, and uses the first that opens. A CARLINKIT_SOFTWARE_ONLY build
-// compiles in only the software backend. coded_w/coded_h seed the decoder's
-// buffer pool (the dongle's Open resolution). Returns nullptr if no backend
-// could be opened. `rot` is a DRM_MODE_ROTATE_* bit the software backend bakes
-// into its output (hardware backends ignore it and leave plane rotation to the
-// caller); pass DRM_MODE_ROTATE_0 for none.
-std::unique_ptr<DecoderSource> create_decoder_source(drm::Device& dev,
-                                                     uint32_t coded_w,
-                                                     uint32_t coded_h,
-                                                     uint64_t rot);
+// The backend CARLINKIT_DECODER selects (Auto when unset or unrecognized). Lets
+// a caller see the user's choice before building the source -- e.g. to decide
+// whether it may substitute software decode to feed a GPU rotate stage.
+DecoderBackend decoder_preference();
+
+// Build the video-decode source. The backend is `force` when given, otherwise
+// chosen by CARLINKIT_DECODER (vaapi|v4l2|software|auto, default auto); Auto
+// tries VAAPI, then V4L2, then software, and uses the first that opens. A
+// CARLINKIT_SOFTWARE_ONLY build compiles in only the software backend.
+// coded_w/coded_h seed the decoder's buffer pool (the dongle's Open
+// resolution). Returns nullptr if no backend could be opened. `rot` is a
+// DRM_MODE_ROTATE_* bit the software backend bakes into its output (hardware
+// backends ignore it and leave plane rotation to the caller); pass
+// DRM_MODE_ROTATE_0 for none.
+std::unique_ptr<DecoderSource> create_decoder_source(
+    drm::Device& dev,
+    uint32_t coded_w,
+    uint32_t coded_h,
+    uint64_t rot,
+    std::optional<DecoderBackend> force = std::nullopt);
 
 }  // namespace ck

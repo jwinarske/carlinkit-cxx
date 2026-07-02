@@ -465,12 +465,19 @@ int main(int argc, char** argv) {
   // CARLINKIT_ROTATE_GPU forces the GPU stage even when the plane could rotate,
   // for testing the pass on hardware whose plane already does 90/270.
   const bool force_gpu = std::getenv("CARLINKIT_ROTATE_GPU") != nullptr;
-  if (rot != 0 && (!plane_can_rot || force_gpu)) {
-    // The plane can't do this angle; rotate + convert on the GPU. The inner
-    // source decodes unrotated and GlRotateSource bakes the angle into an XRGB
-    // buffer the plane scans out. 90/270 swap the output extent.
-    if (auto inner =
-            ck::create_decoder_source(dev, vw, vh, DRM_MODE_ROTATE_0)) {
+  // The GPU stage needs a software inner: it consumes CPU YUV frames, which the
+  // HW decoders don't hand out. When the decoder is Auto (or Software) build
+  // one automatically, so a 90/270 the plane can't do just works instead of
+  // dropping to slow CPU pre-rotation -- no CARLINKIT_DECODER=software needed.
+  // An explicit VAAPI/V4L2 pin opts out (and gets the pre-rotation warning).
+  const ck::DecoderBackend pref = ck::decoder_preference();
+  const bool may_use_sw =
+      pref == ck::DecoderBackend::Auto || pref == ck::DecoderBackend::Software;
+  if (rot != 0 && (!plane_can_rot || force_gpu) && may_use_sw) {
+    // The inner decodes unrotated and GlRotateSource bakes the angle into an
+    // XRGB buffer the plane scans out. 90/270 swap the output extent.
+    if (auto inner = ck::create_decoder_source(dev, vw, vh, DRM_MODE_ROTATE_0,
+                                               ck::DecoderBackend::Software)) {
       const bool sw = rot == DRM_MODE_ROTATE_90 || rot == DRM_MODE_ROTATE_270;
       if (auto gl = ck::GlRotateSource::create(
               dev, std::move(inner), rot, sw ? vh : vw, sw ? vw : vh,
@@ -504,7 +511,9 @@ int main(int argc, char** argv) {
                          : rot == DRM_MODE_ROTATE_180 ? 180
                                                       : 270;
     if (gpu_rotated) {
-      std::fprintf(stderr, "rotating video %u degrees on the GPU\n", deg);
+      std::fprintf(stderr,
+                   "rotating video %u degrees on the GPU (software decode)\n",
+                   deg);
     } else if (applied != 0) {
       std::fprintf(stderr, "rotating video %u degrees in software (CPU)\n",
                    deg);

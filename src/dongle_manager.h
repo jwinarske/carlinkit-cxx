@@ -8,6 +8,7 @@
 // sinks persist across reconnects, so the last frame stays on screen until
 // video resumes.
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -67,6 +68,8 @@ class DongleManager {
   std::thread sup_;
   std::atomic<bool> running_{false};
   std::atomic<bool> connected_{false};
+  // When the current session connected, for flap detection (supervisor thread).
+  std::chrono::steady_clock::time_point connected_at_{};
 };
 
 }  // namespace ck

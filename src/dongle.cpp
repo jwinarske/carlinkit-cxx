@@ -49,6 +49,8 @@ bool Dongle::send(std::vector<uint8_t> frame) {
   tx_inflight_++;
   if (int r = libusb_submit_transfer(t); r != 0) {
     std::fprintf(stderr, "tx submit failed: %s\n", libusb_error_name(r));
+    if (r == LIBUSB_ERROR_NO_DEVICE)
+      failed_ = true;  // surprise removal: signal the supervisor to reconnect
     std::free(buf);
     libusb_free_transfer(t);
     tx_inflight_--;

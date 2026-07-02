@@ -4,6 +4,7 @@
 
 #include <libusb-1.0/libusb.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 
@@ -48,9 +49,37 @@ bool DongleManager::send(std::vector<uint8_t> frame) {
 
 void DongleManager::supervise() {
   using namespace std::chrono;
+  // Reconnect pacing. No delay while healthy or while the dongle is simply
+  // absent (fast plug detection), but back off exponentially when it is present
+  // yet failing -- claim keeps failing, or a session flaps (connects then dies
+  // within kFlapWindow) -- so a wedged dongle doesn't thrash. After a few claim
+  // failures, reset the device to shake it out of a stuck state; it
+  // re-enumerates, so we drop the handle and let the next poll re-open it.
+  constexpr auto kPollAbsent = milliseconds(500);  // steady poll while gone
+  constexpr auto kBackoffMin = milliseconds(250);
+  constexpr auto kBackoffMax = milliseconds(5000);
+  constexpr auto kFlapWindow = seconds(3);
+  constexpr int kResetAfterClaimFails = 3;
+
+  auto backoff = milliseconds(0);
+  int claim_fails = 0;
+  const auto nap = [this](milliseconds d) {  // interruptible sleep
+    const auto end = steady_clock::now() + d;
+    while (running_ && steady_clock::now() < end)
+      std::this_thread::sleep_for(milliseconds(50));
+  };
+  const auto grow_backoff = [&backoff, kBackoffMin, kBackoffMax] {
+    backoff =
+        backoff.count() == 0 ? kBackoffMin : std::min(kBackoffMax, backoff * 2);
+  };
+
   while (running_) {
     if (!connected_) {
-      // Disconnected: poll for the dongle (re)appearing (quiet — no spam).
+      if (backoff.count() > 0)
+        nap(backoff);
+      if (!running_)
+        break;
+      // Poll for the dongle (re)appearing (quiet -- no spam).
       auto usb =
           UsbDevice::open(kDongleVid, kDonglePid, /*quiet=*/true, probe_ctx_);
       if (usb && usb->claim()) {
@@ -64,12 +93,28 @@ void DongleManager::supervise() {
           dongle_ = std::move(d);
         }
         connected_ = true;
+        connected_at_ = steady_clock::now();
+        claim_fails = 0;
+        backoff = milliseconds(0);
         std::fprintf(stderr, "[dongle] connected\n");
         if (on_connected_)
           on_connected_();
+      } else if (usb) {
+        // Present but not claimable -- a stuck state. Back off, and after a few
+        // tries reset the device to force a clean re-enumeration.
+        if (++claim_fails >= kResetAfterClaimFails) {
+          std::fprintf(stderr,
+                       "[dongle] claim failing x%d; resetting the device\n",
+                       claim_fails);
+          usb->reset();  // handle invalidated; usb dropped at scope end
+          claim_fails = 0;
+        }
+        grow_backoff();
       } else {
-        for (int i = 0; i < 5 && running_; ++i)
-          std::this_thread::sleep_for(milliseconds(100));
+        // Absent: fast steady poll for a fresh plug, and a clean slate.
+        backoff = milliseconds(0);
+        claim_fails = 0;
+        nap(kPollAbsent);
       }
     } else {
       // Connected: watch for surprise removal (transfers hit NO_DEVICE).
@@ -79,6 +124,7 @@ void DongleManager::supervise() {
         dead = !dongle_ || dongle_->failed();
       }
       if (dead) {
+        const bool flap = steady_clock::now() - connected_at_ < kFlapWindow;
         {
           std::lock_guard<std::mutex> lk(mu_);
           if (dongle_) {
@@ -88,7 +134,15 @@ void DongleManager::supervise() {
           usb_.reset();
         }
         connected_ = false;
-        std::fprintf(stderr, "[dongle] disconnected\n");
+        if (flap) {
+          grow_backoff();  // died almost immediately -- back off before retry
+          std::fprintf(stderr,
+                       "[dongle] disconnected (flap; backing off %lldms)\n",
+                       static_cast<long long>(backoff.count()));
+        } else {
+          backoff = milliseconds(0);  // a good session -- clean slate
+          std::fprintf(stderr, "[dongle] disconnected\n");
+        }
         if (on_disconnected_)
           on_disconnected_();
       } else {

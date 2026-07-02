@@ -300,35 +300,52 @@ void AudioInput::stop() {
 }
 
 void AudioInput::run() {
-  snd_pcm_t* pcm = nullptr;
-  if (int r = snd_pcm_open(&pcm, device_.c_str(), SND_PCM_STREAM_CAPTURE, 0);
-      r < 0) {
-    std::fprintf(stderr, "alsa: capture open(%s): %s\n", device_.c_str(),
-                 snd_strerror(r));
-    running_ = false;
-    return;
-  }
-  // 16 kHz mono S16LE to match send_audio()'s decodeType 5.
-  if (snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE,
-                         SND_PCM_ACCESS_RW_INTERLEAVED, 1, 16000, 1,
-                         100000) < 0) {
-    snd_pcm_close(pcm);
-    running_ = false;
-    return;
-  }
   std::vector<int16_t> buf(320);  // ~20 ms
+  bool open_warned = false;
+  const auto retry_nap = [this] {
+    for (int i = 0; i < 5 && running_; ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  };
+  // (Re)open the mic and capture until a hard error, retrying while running_. A
+  // busy/not-yet-ready device, a mid-call glitch, or a USB-mic replug must not
+  // mute Siri for the rest of the session -- so we reopen rather than give up.
   while (running_) {
-    snd_pcm_sframes_t n = snd_pcm_readi(pcm, buf.data(), buf.size());
-    if (n < 0) {
-      n = snd_pcm_recover(pcm, static_cast<int>(n), 1);
-      if (n < 0)
-        break;
+    snd_pcm_t* pcm = nullptr;
+    if (int r = snd_pcm_open(&pcm, device_.c_str(), SND_PCM_STREAM_CAPTURE, 0);
+        r < 0) {
+      if (!open_warned) {  // log once per failure streak, not every retry
+        std::fprintf(stderr, "alsa: capture open(%s): %s; retrying\n",
+                     device_.c_str(), snd_strerror(r));
+        open_warned = true;
+      }
+      retry_nap();
       continue;
     }
-    if (n > 0 && cb_)
-      cb_(buf.data(), static_cast<size_t>(n));
+    // 16 kHz mono S16LE to match send_audio()'s decodeType 5.
+    if (snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE,
+                           SND_PCM_ACCESS_RW_INTERLEAVED, 1, 16000, 1,
+                           100000) < 0) {
+      snd_pcm_close(pcm);
+      retry_nap();
+      continue;
+    }
+    open_warned = false;  // opened cleanly; reset the streak
+    while (running_) {
+      snd_pcm_sframes_t n = snd_pcm_readi(pcm, buf.data(), buf.size());
+      if (n < 0) {
+        n = snd_pcm_recover(pcm, static_cast<int>(n), 1);
+        if (n < 0) {  // unrecoverable (e.g. the USB mic vanished) -- reopen
+          std::fprintf(stderr, "alsa: capture error: %s; reopening\n",
+                       snd_strerror(static_cast<int>(n)));
+          break;
+        }
+        continue;
+      }
+      if (n > 0 && cb_)
+        cb_(buf.data(), static_cast<size_t>(n));
+    }
+    snd_pcm_close(pcm);
   }
-  snd_pcm_close(pcm);
 }
 
 }  // namespace ck

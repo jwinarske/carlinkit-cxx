@@ -189,6 +189,7 @@ void SoftwareDecoderSource::on_frame(const AVFrame* frame) {
     std::lock_guard<std::mutex> lk(m_);
     av_frame_unref(latest_gpu_frame_);
     av_frame_ref(latest_gpu_frame_, frame);
+    gpu_frame_seq_.fetch_add(1, std::memory_order_release);
     return;
   }
 
@@ -277,6 +278,9 @@ bool SoftwareDecoderSource::acquire_decoded_frame(DecodedFrame& out) {
     out.planes[i].stride = static_cast<uint32_t>(gpu_borrowed_->linesize[i]);
   }
   out.pts_ns = 0;
+  // Under m_, latest_gpu_frame_ and the seq were set together in on_frame, so
+  // this seq names exactly the frame just reffed into gpu_borrowed_.
+  out.seq = gpu_frame_seq_.load(std::memory_order_acquire);
   return true;
 }
 

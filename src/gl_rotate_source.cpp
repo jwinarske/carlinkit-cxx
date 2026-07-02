@@ -250,6 +250,7 @@ bool GlRotateSource::render_frame() {
     return false;
   }
   rendered_once_ = true;
+  last_seq_ = f.seq;
   return true;
 }
 
@@ -268,9 +269,10 @@ void GlRotateSource::release(drm::scene::AcquiredBuffer acquired) noexcept {
 }
 
 bool GlRotateSource::has_fresh_content() const noexcept {
-  // A live video: always offer the latest frame. (Idle-skip can be added once
-  // the inner source signals "no new frame since last acquire".)
-  return true;
+  // Fresh only when the inner decoder has a newer frame than the one last
+  // rendered; when the screen is static the scene then keeps scanning out the
+  // current buffer instead of re-committing an identical image every vblank.
+  return inner_->gpu_frame_seq() > last_seq_;
 }
 
 drm::scene::BindingModel GlRotateSource::binding_model() const noexcept {

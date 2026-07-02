@@ -40,6 +40,10 @@ struct DecodedFrame {
   };
   Plane planes[3]{};
   uint64_t pts_ns{0};
+  // Monotonic index of this frame within the source's GPU-ingest stream, so a
+  // consumer can tell whether a later acquire would return a newer frame (see
+  // DecoderSource::gpu_frame_seq) and skip redrawing an unchanged image.
+  uint64_t seq{0};
 };
 
 class DecoderSource : public drm::scene::LayerBufferSource {
@@ -77,6 +81,12 @@ class DecoderSource : public drm::scene::LayerBufferSource {
   // it (software does; HW backends that hand out a dma-buf do not yet). Call
   // once before the first frame arrives.
   [[nodiscard]] virtual bool enable_gpu_ingest() { return false; }
+
+  // Monotonic count of frames made available for GPU ingest since start, so a
+  // consumer can detect a new frame without acquiring it — and skip re-drawing
+  // (and re-committing) an unchanged image every vblank. The software backend
+  // bumps it per kept frame; backends with no CPU-side frame stay at 0.
+  [[nodiscard]] virtual uint64_t gpu_frame_seq() const noexcept { return 0; }
 };
 
 // Which backend create_decoder_source should use. Auto runs the full fallback

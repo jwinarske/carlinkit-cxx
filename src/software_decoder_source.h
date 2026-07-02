@@ -68,6 +68,9 @@ class SoftwareDecoderSource : public DecoderSource {
   [[nodiscard]] bool enable_gpu_ingest() override;
   [[nodiscard]] bool acquire_decoded_frame(DecodedFrame& out) override;
   void release_decoded_frame() noexcept override;
+  [[nodiscard]] uint64_t gpu_frame_seq() const noexcept override {
+    return gpu_frame_seq_.load(std::memory_order_acquire);
+  }
 
  private:
   SoftwareDecoderSource(drm::Device& dev,
@@ -122,6 +125,10 @@ class SoftwareDecoderSource : public DecoderSource {
   bool gpu_ingest_ = false;
   AVFrame* latest_gpu_frame_ = nullptr;  // RX thread writes; guarded by m_
   AVFrame* gpu_borrowed_ = nullptr;      // commit-thread borrow ref
+  // Bumped (under m_) each time a new frame is kept in latest_gpu_frame_; read
+  // lock-free by a GPU consumer to detect a new frame. Stamped onto each
+  // acquired DecodedFrame so the consumer knows exactly which frame it drew.
+  std::atomic<uint64_t> gpu_frame_seq_{0};
 
   mutable std::mutex m_;
   Buf bufs_[kBufs];

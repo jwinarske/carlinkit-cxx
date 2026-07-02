@@ -54,6 +54,10 @@
 #include "dongle_manager.h"
 #include "input_touch.h"
 
+#ifdef CARLINKIT_GL
+#include "gl_rotate_source.h"
+#endif
+
 namespace {
 std::atomic<bool> g_quit{false};
 std::atomic<bool> g_capture{false};
@@ -450,16 +454,37 @@ int main(int argc, char** argv) {
   }
   auto scene = std::move(*scene_r);
 
-  // Ask the scene which rotations an NV12 plane on this CRTC supports and give
-  // the source only the residual the plane can't do. When a plane covers the
-  // angle, sw_rot is 0: the software source skips its CPU rotate and the plane
-  // rotates zero-copy; the allocator binds only a plane that supports the
-  // angle.
+  // Decide who rotates: the plane (if it advertises the angle), a GPU stage (if
+  // not, and EGL/GLES are present), or the software backend as a last resort.
   const uint64_t plane_can_do = scene->candidate_rotation(DRM_FORMAT_NV12);
   const bool plane_can_rot = rot != 0 && (plane_can_do & rot) == rot;
-  const uint64_t sw_rot = plane_can_rot ? 0 : rot;
 
-  auto src = ck::create_decoder_source(dev, vw, vh, sw_rot);
+  std::unique_ptr<ck::DecoderSource> src;
+  bool gpu_rotated = false;
+#ifdef CARLINKIT_GL
+  // CARLINKIT_ROTATE_GPU forces the GPU stage even when the plane could rotate,
+  // for testing the pass on hardware whose plane already does 90/270.
+  const bool force_gpu = std::getenv("CARLINKIT_ROTATE_GPU") != nullptr;
+  if (rot != 0 && (!plane_can_rot || force_gpu)) {
+    // The plane can't do this angle; rotate + convert on the GPU. The inner
+    // source decodes unrotated and GlRotateSource bakes the angle into an XRGB
+    // buffer the plane scans out. 90/270 swap the output extent.
+    if (auto inner =
+            ck::create_decoder_source(dev, vw, vh, DRM_MODE_ROTATE_0)) {
+      const bool sw = rot == DRM_MODE_ROTATE_90 || rot == DRM_MODE_ROTATE_270;
+      if (auto gl = ck::GlRotateSource::create(
+              dev, std::move(inner), rot, sw ? vh : vw, sw ? vw : vh,
+              scene->candidate_modifiers(DRM_FORMAT_ARGB8888))) {
+        src = std::move(gl);
+        gpu_rotated = true;
+      }
+    }
+  }
+#endif
+  if (!src) {
+    // The plane rotates it (residual 0), or the software backend bakes it.
+    src = ck::create_decoder_source(dev, vw, vh, plane_can_rot ? 0 : rot);
+  }
   if (!src) {
     std::fprintf(stderr, "no video decoder available\n");
     return 1;
@@ -478,7 +503,9 @@ int main(int argc, char** argv) {
     const unsigned deg = rot == DRM_MODE_ROTATE_90    ? 90
                          : rot == DRM_MODE_ROTATE_180 ? 180
                                                       : 270;
-    if (applied != 0) {
+    if (gpu_rotated) {
+      std::fprintf(stderr, "rotating video %u degrees on the GPU\n", deg);
+    } else if (applied != 0) {
       std::fprintf(stderr, "rotating video %u degrees in software (CPU)\n",
                    deg);
     } else if (plane_can_rot) {

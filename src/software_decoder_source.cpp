@@ -93,6 +93,10 @@ SoftwareDecoderSource::~SoftwareDecoderSource() {
     sws_freeContext(sws_);
   if (frame_)
     av_frame_free(&frame_);
+  if (latest_gpu_frame_)
+    av_frame_free(&latest_gpu_frame_);
+  if (gpu_borrowed_)
+    av_frame_free(&gpu_borrowed_);
   if (pkt_)
     av_packet_free(&pkt_);
   if (parser_)
@@ -178,6 +182,16 @@ void SoftwareDecoderSource::on_frame(const AVFrame* frame) {
     }
     return;
   }
+
+  if (gpu_ingest_) {
+    // GPU rotate/convert lane: keep the raw YUV420P frame for a GPU stage to
+    // upload; skip the CPU convert, rotate, and dumb buffer entirely.
+    std::lock_guard<std::mutex> lk(m_);
+    av_frame_unref(latest_gpu_frame_);
+    av_frame_ref(latest_gpu_frame_, frame);
+    return;
+  }
+
   if (!ensure_pool(w, h))
     return;
 
@@ -231,6 +245,46 @@ void SoftwareDecoderSource::on_frame(const AVFrame* frame) {
 
   std::lock_guard<std::mutex> lk(m_);
   pending_ = slot;  // latest-frame-wins; any prior unconsumed pending is freed
+}
+
+bool SoftwareDecoderSource::enable_gpu_ingest() {
+  std::lock_guard<std::mutex> lk(m_);
+  if (!gpu_ingest_) {
+    latest_gpu_frame_ = av_frame_alloc();
+    gpu_borrowed_ = av_frame_alloc();
+    gpu_ingest_ = latest_gpu_frame_ != nullptr && gpu_borrowed_ != nullptr;
+  }
+  return gpu_ingest_;
+}
+
+bool SoftwareDecoderSource::acquire_decoded_frame(DecodedFrame& out) {
+  std::lock_guard<std::mutex> lk(m_);
+  if (!gpu_ingest_ || latest_gpu_frame_->buf[0] == nullptr) {
+    return false;  // no frame decoded yet
+  }
+  // Take our own ref so the planes stay valid while the commit thread uploads,
+  // even if the RX thread decodes a newer frame into latest_gpu_frame_.
+  av_frame_unref(gpu_borrowed_);
+  if (av_frame_ref(gpu_borrowed_, latest_gpu_frame_) < 0) {
+    return false;
+  }
+  out.fourcc = DRM_FORMAT_YUV420;  // planar Y/U/V, 4:2:0
+  out.width = static_cast<uint32_t>(gpu_borrowed_->width);
+  out.height = static_cast<uint32_t>(gpu_borrowed_->height);
+  out.num_planes = 3;
+  for (int i = 0; i < 3; ++i) {
+    out.planes[i].data = gpu_borrowed_->data[i];
+    out.planes[i].stride = static_cast<uint32_t>(gpu_borrowed_->linesize[i]);
+  }
+  out.pts_ns = 0;
+  return true;
+}
+
+void SoftwareDecoderSource::release_decoded_frame() noexcept {
+  std::lock_guard<std::mutex> lk(m_);
+  if (gpu_borrowed_ != nullptr) {
+    av_frame_unref(gpu_borrowed_);
+  }
 }
 
 bool SoftwareDecoderSource::ensure_pool(uint32_t w, uint32_t h) {

@@ -53,6 +53,11 @@ endif()
 # DRM_CXX_DIR to build against a local working tree instead.
 set(DRM_CXX_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/drm-cxx" CACHE PATH "Path to drm-cxx source tree")
 pkg_check_modules(LIBDRM IMPORTED_TARGET libdrm)
+# EGL + GLESv2 back the GPU rotate/convert fallback for angles a plane can't do
+# (90/270 on the Pi's vc6). Optional: absent -> the software rotate stays the
+# only fallback.
+pkg_check_modules(EGL IMPORTED_TARGET egl)
+pkg_check_modules(GLES IMPORTED_TARGET glesv2)
 # Force the CPU-only decode path, omitting the VAAPI and V4L2 backends (and
 # their libva dependency) from the build to minimize code size. The runtime
 # CARLINKIT_DECODER override is ignored in this build.
@@ -79,6 +84,11 @@ if(LIBAV_FOUND AND LIBSWS_FOUND AND LIBDRM_FOUND AND EXISTS "${DRM_CXX_DIR}/CMak
       message(WARNING "meson not found; run 'meson subprojects download' in ${DRM_CXX_DIR}")
     endif()
   endif()
+  # The GLES rotate stage needs drm-cxx's GlScanoutProducer (EGL); force it on
+  # when EGL/GLESv2 are present so it compiles into libdrm-cxx.
+  if(EGL_FOUND AND GLES_FOUND)
+    set(DRM_CXX_EGL ON CACHE STRING "" FORCE)
+  endif()
   add_subdirectory(${DRM_CXX_DIR} ${CMAKE_BINARY_DIR}/drm-cxx-build)
 
   set(KMS_SOURCES
@@ -100,12 +110,21 @@ if(LIBAV_FOUND AND LIBSWS_FOUND AND LIBDRM_FOUND AND EXISTS "${DRM_CXX_DIR}/CMak
       src/v4l2_decoder_source_adapter.cpp)
     list(APPEND KMS_LIBS PkgConfig::LIBVA)
   endif()
+  if(EGL_FOUND AND GLES_FOUND)
+    # GPU rotate/convert fallback (GlRotateSource) for 90/270 on planes that
+    # can't rotate; needs drm-cxx's GlScanoutProducer (EGL) plus GLESv2.
+    list(APPEND KMS_SOURCES src/gl_rotate_source.cpp)
+    list(APPEND KMS_LIBS PkgConfig::EGL PkgConfig::GLES)
+  endif()
 
   add_executable(carlinkit-kms ${KMS_SOURCES})
   target_include_directories(carlinkit-kms PRIVATE ${DRM_CXX_DIR}/examples/common)
   target_link_libraries(carlinkit-kms PRIVATE ${KMS_LIBS})
   if(CARLINKIT_SOFTWARE_ONLY)
     target_compile_definitions(carlinkit-kms PRIVATE CARLINKIT_SOFTWARE_ONLY)
+  endif()
+  if(EGL_FOUND AND GLES_FOUND)
+    target_compile_definitions(carlinkit-kms PRIVATE CARLINKIT_GL)
   endif()
   target_compile_options(carlinkit-kms PRIVATE -Wall -Wextra)
 else()

@@ -64,6 +64,11 @@ class SoftwareDecoderSource : public DecoderSource {
   }
   drm::scene::SourceFormat format() const noexcept override;
 
+  // ── GPU rotate/convert ingest ──────────────────────────────────────────────
+  [[nodiscard]] bool enable_gpu_ingest() override;
+  [[nodiscard]] bool acquire_decoded_frame(DecodedFrame& out) override;
+  void release_decoded_frame() noexcept override;
+
  private:
   SoftwareDecoderSource(drm::Device& dev,
                         int drm_fd,
@@ -110,6 +115,13 @@ class SoftwareDecoderSource : public DecoderSource {
   AVPacket* pkt_ = nullptr;
   AVFrame* frame_ = nullptr;
   SwsContext* sws_ = nullptr;  // rebuilt on demand for the source pixel format
+
+  // GPU-ingest lane: keep the latest raw YUV420P frame for a GPU rotate/convert
+  // stage instead of converting to NV12 in a dumb buffer. gpu_borrowed_ holds a
+  // ref while the commit thread uploads it (acquire..release_decoded_frame).
+  bool gpu_ingest_ = false;
+  AVFrame* latest_gpu_frame_ = nullptr;  // RX thread writes; guarded by m_
+  AVFrame* gpu_borrowed_ = nullptr;      // commit-thread borrow ref
 
   mutable std::mutex m_;
   Buf bufs_[kBufs];

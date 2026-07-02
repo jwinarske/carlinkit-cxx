@@ -26,6 +26,22 @@ class Device;
 
 namespace ck {
 
+// A decoded frame's CPU pixel planes, borrowed by a GPU rotate/convert stage to
+// upload as textures. Valid only until release_decoded_frame(); the backend
+// keeps the frame pinned in between.
+struct DecodedFrame {
+  uint32_t fourcc{0};  // planar layout, e.g. DRM_FORMAT_YUV420 (I420)
+  uint32_t width{0};
+  uint32_t height{0};
+  uint32_t num_planes{0};
+  struct Plane {
+    const uint8_t* data{nullptr};
+    uint32_t stride{0};
+  };
+  Plane planes[3]{};
+  uint64_t pts_ns{0};
+};
+
 class DecoderSource : public drm::scene::LayerBufferSource {
  public:
   // Feed Annex-B H.264 bytes (any chunking), called from the dongle RX thread.
@@ -45,6 +61,22 @@ class DecoderSource : public drm::scene::LayerBufferSource {
   // must not also rotate the plane. 0 means the source did not rotate (the
   // caller drives plane rotation). Only the software backend overrides this.
   [[nodiscard]] virtual uint64_t applied_rotation() const noexcept { return 0; }
+
+  // Borrow the latest decoded frame's CPU planes for a GPU rotate/convert stage
+  // to upload. Returns false when no frame is ready, or for a backend with no
+  // CPU-side frame (the HW decoders, for now). The frame stays valid until
+  // release_decoded_frame(); acquire again for the next frame.
+  [[nodiscard]] virtual bool acquire_decoded_frame(DecodedFrame& /*out*/) {
+    return false;
+  }
+  virtual void release_decoded_frame() noexcept {}
+
+  // Switch the backend to "GPU ingest": stop producing its own scanout buffer
+  // and keep the latest decoded frame available via acquire_decoded_frame() for
+  // a GPU rotate/convert stage to consume. Returns true if the backend supports
+  // it (software does; HW backends that hand out a dma-buf do not yet). Call
+  // once before the first frame arrives.
+  [[nodiscard]] virtual bool enable_gpu_ingest() { return false; }
 };
 
 // Which backend create_decoder_source should use. Auto runs the full fallback

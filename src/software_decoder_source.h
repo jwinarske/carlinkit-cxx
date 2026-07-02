@@ -63,6 +63,9 @@ class SoftwareDecoderSource : public DecoderSource {
     return drm::scene::BindingModel::SceneSubmitsFbId;
   }
   drm::scene::SourceFormat format() const noexcept override;
+  // Fresh only while a freshly decoded buffer waits to be shown, so a static
+  // screen skips the page flip (see main_kms's commit gate).
+  [[nodiscard]] bool has_fresh_content() const noexcept override;
 
   // ── GPU rotate/convert ingest ──────────────────────────────────────────────
   [[nodiscard]] bool enable_gpu_ingest() override;

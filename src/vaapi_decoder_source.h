@@ -58,6 +58,9 @@ class VaapiDecoderSource : public DecoderSource {
     return drm::scene::BindingModel::SceneSubmitsFbId;
   }
   drm::scene::SourceFormat format() const noexcept override;
+  // Fresh only while a decoded surface waits to be imported, so a static screen
+  // skips the page flip (see main_kms's commit gate).
+  [[nodiscard]] bool has_fresh_content() const noexcept override;
 
  private:
   VaapiDecoderSource(drm::Device& dev, int drm_fd, uint32_t w, uint32_t h);

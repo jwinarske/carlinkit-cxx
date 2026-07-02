@@ -36,6 +36,12 @@ class UsbDevice {
   // vendor bulk IN/OUT endpoints. Returns false on any failure.
   bool claim();
 
+  // Force a USB device reset. The dongle re-enumerates, so the handle is
+  // invalid afterwards: the caller must drop this UsbDevice and re-open. A
+  // recovery for a dongle stuck unclaimable -- NOT used on a healthy freshly
+  // plugged device (claim() deliberately avoids resetting for that reason).
+  bool reset();
+
   // Synchronous bulk transfer. Returns bytes transferred, or <0 libusb error.
   int bulk_out(const uint8_t* data, int len, unsigned timeout_ms = 1000);
   int bulk_in(uint8_t* data,

@@ -93,6 +93,15 @@ bool UsbDevice::claim() {
   return true;
 }
 
+bool UsbDevice::reset() {
+  if (handle_ == nullptr)
+    return false;
+  const int r = libusb_reset_device(handle_);
+  // LIBUSB_ERROR_NOT_FOUND means the device re-enumerated at a new address --
+  // the expected outcome here; either way the caller drops this handle.
+  return r == 0 || r == LIBUSB_ERROR_NOT_FOUND;
+}
+
 int UsbDevice::bulk_out(const uint8_t* data, int len, unsigned timeout_ms) {
   int transferred = 0;
   int r = libusb_bulk_transfer(handle_, ep_out_, const_cast<uint8_t*>(data),

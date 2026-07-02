@@ -280,4 +280,10 @@ drm::scene::SourceFormat VaapiDecoderSource::format() const noexcept {
   return fmt_;
 }
 
+bool VaapiDecoderSource::has_fresh_content() const noexcept {
+  std::lock_guard<std::mutex> lk(m_);
+  return pending_
+      .valid;  // a decoded surface is waiting for acquire() to import
+}
+
 }  // namespace ck

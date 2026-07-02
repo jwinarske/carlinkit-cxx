@@ -247,4 +247,9 @@ drm::scene::SourceFormat V4l2DecoderSourceAdapter::format() const noexcept {
   return inner_->format();
 }
 
+bool V4l2DecoderSourceAdapter::has_fresh_content() const noexcept {
+  std::lock_guard<std::mutex> lk(inner_m_);
+  return inner_->has_fresh_content();
+}
+
 }  // namespace ck

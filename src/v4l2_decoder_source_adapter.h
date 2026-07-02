@@ -54,6 +54,9 @@ class V4l2DecoderSourceAdapter : public DecoderSource {
     return drm::scene::BindingModel::SceneSubmitsFbId;
   }
   drm::scene::SourceFormat format() const noexcept override;
+  // Forwarded from the inner source: fresh only while a decoded CAPTURE buffer
+  // waits to be acquired, so a static screen skips the page flip.
+  [[nodiscard]] bool has_fresh_content() const noexcept override;
 
  private:
   explicit V4l2DecoderSourceAdapter(

@@ -62,10 +62,25 @@ class VaapiDecoderSource : public DecoderSource {
   // skips the page flip (see main_kms's commit gate).
   [[nodiscard]] bool has_fresh_content() const noexcept override;
 
+  // ── Presentation-neutral producer (the Wayland / FrameSink path) ────────────
+  // Expose the newest decoded surface as a NativeFrame (borrowed DMA-BUF fds)
+  // instead of importing it into a KMS framebuffer. Shares the decode-side
+  // pending/retain machinery with acquire(); a given binary drives one or the
+  // other, never both.
+  [[nodiscard]] bool acquire_native_frame(NativeFrame& out) override;
+
  private:
   VaapiDecoderSource(drm::Device& dev, int drm_fd, uint32_t w, uint32_t h);
   void on_decoded(const DrmFrame& f, AVFrame* surface_frame);  // decode thread
   void import_pending_locked();  // commit thread, holds m_
+  // True if pending_ may be presented; false (with a one-shot warning) if its
+  // size no longer matches the locked-in format and it must be dropped. Holds
+  // m_.
+  [[nodiscard]] bool pending_size_ok_locked();
+  // Pin pending_'s surface and adopt its dup'd fds as the current native frame,
+  // closing the previous one's. Holds m_; consumes pending_ (leaves it empty).
+  void promote_pending_native_locked();
+  void close_current_native_locked() noexcept;  // holds m_
 
   // One cached KMS framebuffer + its GEM handles, imported once per VASurface.
   struct FbEntry {
@@ -97,6 +112,20 @@ class VaapiDecoderSource : public DecoderSource {
     uint32_t offset[4] = {0}, pitch[4] = {0};
     AVFrame* held = nullptr;
   } pending_;
+
+  // Native-frame path only: the promoted frame whose borrowed fds are handed
+  // out by acquire_native_frame. Owns the dup'd fds (closed on the next promote
+  // / at exit); the surface is pinned via retained_, exactly as the KMS import
+  // pins it.
+  struct CurrentNative {
+    bool valid = false;
+    uint32_t surface_id = 0;
+    uint32_t w = 0, h = 0, fourcc = 0;
+    uint64_t modifier = 0;
+    int nplanes = 0;
+    int fd[4] = {-1, -1, -1, -1};
+    uint32_t offset[4] = {0}, pitch[4] = {0};
+  } current_native_;
 
   // One framebuffer per surface, created once and reused (the pool is fixed).
   std::unordered_map<uint32_t, FbEntry> fb_cache_;

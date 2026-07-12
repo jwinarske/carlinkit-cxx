@@ -4,8 +4,9 @@
 // compositor (no DRM master, no free VT — runs as an ordinary client).
 //
 // The dongle's H.264 is HW-decoded to an NV12 DMA-BUF (headless VAAPI, no KMS
-// device), imported into a wl_buffer (WaylandSink), and presented on a
-// fullscreen xdg toplevel. Per-surface dmabuf feedback drives the zero-copy
+// device), imported into a wl_buffer (WaylandSink), and presented on an xdg
+// toplevel (windowed by default; CARLINKIT_FULLSCREEN for the head-unit kiosk).
+// Per-surface dmabuf feedback drives the zero-copy
 // verdict; wl_surface.frame paces commits; wp_presentation reports whether the
 // compositor scanned the buffer out directly (the ZERO_COPY flag).
 //
@@ -441,7 +442,12 @@ bool App::CreateSurface() {
   toplevel->app_ = this;
   toplevel->SetTitle("carlinkit");
   toplevel->SetAppId("org.carlinkit.wayland");
-  toplevel->SetFullscreen(nullptr);  // compositor chooses the output
+  // Windowed by default; CARLINKIT_FULLSCREEN opts into the kiosk/head-unit
+  // fullscreen presentation (also what makes the surface eligible for direct
+  // scanout). Windowed: the compositor sends a 0x0 configure and the surface
+  // takes the video's native size, refitting via the viewport if resized.
+  if (std::getenv("CARLINKIT_FULLSCREEN") != nullptr)
+    toplevel->SetFullscreen(nullptr);  // compositor chooses the output
 
   // Opaque video surface with no alpha: a viewport scales the decoded buffer to
   // an aspect-fitted destination the compositor centers within the output.

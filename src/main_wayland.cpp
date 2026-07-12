@@ -107,35 +107,11 @@ std::string render_node_for_device(dev_t want) {
   return result;
 }
 
-// CARLINKIT_ROTATE content rotation in degrees (0/90/180/270; other values 0).
-int rotation_degrees() {
-  const char* r = std::getenv("CARLINKIT_ROTATE");
-  if (r == nullptr)
-    return 0;
-  int d = static_cast<int>(std::strtol(r, nullptr, 10)) % 360;
-  if (d < 0)
-    d += 360;
-  return (d == 90 || d == 180 || d == 270) ? d : 0;
-}
-
-// wl_surface.set_buffer_transform value for a content rotation. set_buffer_
-// transform is inverse-semantics (the compositor un-does it), so 90 and 270 are
-// swapped. NOTE: the exact clockwise/counter-clockwise direction depends on the
-// panel and must be confirmed with a golden-orientation asset — if the image is
-// rotated the wrong way, swap the 90 and 270 cases here (and the touch inverse
-// in SendTouchNorm stays consistent because it keys off the same rot_deg_).
-uint32_t buffer_transform_for(int deg) {
-  switch (deg) {
-    case 90:
-      return 3;  // WL_OUTPUT_TRANSFORM_270
-    case 180:
-      return 2;  // WL_OUTPUT_TRANSFORM_180
-    case 270:
-      return 1;  // WL_OUTPUT_TRANSFORM_90
-    default:
-      return 0;  // WL_OUTPUT_TRANSFORM_NORMAL
-  }
-}
+// Display/panel orientation is the compositor's output configuration
+// (wl_output.transform) — it rotates the whole output and transforms input to
+// match, transparently to clients. So carlinkit-wayland presents an unrotated
+// buffer and does no rotation of its own (unlike carlinkit-kms, which drives
+// the panel directly and must rotate itself).
 
 class App;
 
@@ -271,7 +247,6 @@ class App {
   bool frame_pending_ = false;  // a frame callback is in flight (pacing)
   uint32_t present_seq_ = 0;
   int32_t width_ = 0, height_ = 0;  // configured (fullscreen) surface size
-  int rot_deg_ = 0;                 // CARLINKIT_ROTATE content rotation
 };
 
 void WlCallbackHandler::OnDone(uint32_t time_ms) {
@@ -468,18 +443,6 @@ bool App::CreateSurface() {
   toplevel->SetAppId("org.carlinkit.wayland");
   toplevel->SetFullscreen(nullptr);  // compositor chooses the output
 
-  // Rung 1 rotation: attach an unrotated NV12 buffer and let the compositor
-  // rotate it (free when it scans out on a rotating plane, GPU composite
-  // otherwise). The buffer/decoder stay unrotated; only presentation rotates.
-  rot_deg_ = rotation_degrees();
-  if (rot_deg_ != 0) {
-    surface_.Get()->SetBufferTransform(buffer_transform_for(rot_deg_));
-    std::fprintf(stderr,
-                 "[rotate] content %d deg via buffer_transform (direction "
-                 "pending a golden-orientation test)\n",
-                 rot_deg_);
-  }
-
   // Opaque video surface with no alpha: a viewport scales the decoded buffer to
   // an aspect-fitted destination the compositor centers within the output.
   if (viewporter_.Get() != nullptr &&
@@ -629,18 +592,14 @@ void App::RenderIfReady() {
   surf->DamageBuffer(0, 0, static_cast<int32_t>(fw), static_cast<int32_t>(fh));
   // Surface logical size = the viewport destination (aspect-fitted, compositor-
   // centered), or the buffer size when no viewport. Input maps against this.
-  // 90/270 rotation swaps the on-screen (post-transform) content extent.
-  const bool swap = rot_deg_ == 90 || rot_deg_ == 270;
-  const uint32_t cw = swap ? fh : fw;
-  const uint32_t ch = swap ? fw : fh;
-  surf_w_ = static_cast<int32_t>(cw);
-  surf_h_ = static_cast<int32_t>(ch);
+  surf_w_ = static_cast<int32_t>(fw);
+  surf_h_ = static_cast<int32_t>(fh);
   if (viewport_.Get() != nullptr && viewport_.Get()->GetProxy() != nullptr &&
-      width_ > 0 && height_ > 0 && cw > 0 && ch > 0) {
-    const double fit = std::min(static_cast<double>(width_) / cw,
-                                static_cast<double>(height_) / ch);
-    surf_w_ = static_cast<int32_t>(std::lround(cw * fit));
-    surf_h_ = static_cast<int32_t>(std::lround(ch * fit));
+      width_ > 0 && height_ > 0 && fw > 0 && fh > 0) {
+    const double fit = std::min(static_cast<double>(width_) / fw,
+                                static_cast<double>(height_) / fh);
+    surf_w_ = static_cast<int32_t>(std::lround(fw * fit));
+    surf_h_ = static_cast<int32_t>(std::lround(fh * fit));
     viewport_.Get()->SetDestination(surf_w_, surf_h_);
   }
   RequestFrameCallback();
@@ -660,32 +619,11 @@ void App::OnFrameReady(uint32_t /*time_ms*/) {
 void App::SendTouchNorm(double x, double y, ck::TouchAction a) {
   if (mgr_ == nullptr || surf_w_ <= 0 || surf_h_ <= 0)
     return;
-  // Normalized point within the on-screen (post-transform) content rect.
-  const double lx = std::clamp(x / surf_w_, 0.0, 1.0);
-  const double ly = std::clamp(y / surf_h_, 0.0, 1.0);
-  // Un-rotate back into the unrotated video frame (the dongle's coordinate
-  // space), the inverse of the content rotation applied at present time. Keyed
-  // off the same rot_deg_ as buffer_transform_for, so the two stay consistent.
-  double u = lx;
-  double v = ly;
-  switch (rot_deg_) {
-    case 90:
-      u = 1.0 - ly;
-      v = lx;
-      break;
-    case 180:
-      u = 1.0 - lx;
-      v = 1.0 - ly;
-      break;
-    case 270:
-      u = ly;
-      v = 1.0 - lx;
-      break;
-    default:
-      break;
-  }
-  last_nx_ = static_cast<float>(u);
-  last_ny_ = static_cast<float>(v);
+  // Surface-local coordinates are already in the video's frame: the compositor
+  // delivers input in the (output-transformed) surface space, so any panel
+  // rotation is handled upstream and needs no un-rotation here.
+  last_nx_ = static_cast<float>(std::clamp(x / surf_w_, 0.0, 1.0));
+  last_ny_ = static_cast<float>(std::clamp(y / surf_h_, 0.0, 1.0));
   mgr_->send_touch(last_nx_, last_ny_, a);
 }
 

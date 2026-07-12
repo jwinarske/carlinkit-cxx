@@ -30,9 +30,20 @@ namespace ck {
 class VaapiDecoderSource : public DecoderSource {
  public:
   // coded_w/h size the decoder's surface pool; should match the dongle's Open
-  // resolution. Returns nullptr on decoder-open failure.
+  // resolution. Returns nullptr on decoder-open failure. `dev` supplies the KMS
+  // fd used to import decoded frames as framebuffers for the acquire() (KMS)
+  // path.
   static std::unique_ptr<VaapiDecoderSource> create(
       drm::Device& dev,
+      uint32_t coded_w,
+      uint32_t coded_h,
+      const char* render_node = "/dev/dri/renderD128");
+
+  // Headless variant for the Wayland / FrameSink path: no KMS device — decoded
+  // frames are handed out as NativeFrames (acquire_native_frame) for a sink to
+  // import, so no drm::Device / framebuffer import is needed. The KMS acquire()
+  // path is unavailable on a source built this way.
+  static std::unique_ptr<VaapiDecoderSource> create_headless(
       uint32_t coded_w,
       uint32_t coded_h,
       const char* render_node = "/dev/dri/renderD128");
@@ -62,10 +73,27 @@ class VaapiDecoderSource : public DecoderSource {
   // skips the page flip (see main_kms's commit gate).
   [[nodiscard]] bool has_fresh_content() const noexcept override;
 
+  // ── Presentation-neutral producer (the Wayland / FrameSink path)
+  // ──────────── Expose the newest decoded surface as a NativeFrame (borrowed
+  // DMA-BUF fds) instead of importing it into a KMS framebuffer. Shares the
+  // decode-side pending/retain machinery with acquire(); a given binary drives
+  // one or the other, never both.
+  [[nodiscard]] bool acquire_native_frame(NativeFrame& out) override;
+
  private:
-  VaapiDecoderSource(drm::Device& dev, int drm_fd, uint32_t w, uint32_t h);
+  // drm_fd is the KMS device fd for the framebuffer import, or -1 for a
+  // headless (Wayland) source that never imports.
+  VaapiDecoderSource(int drm_fd, uint32_t w, uint32_t h);
   void on_decoded(const DrmFrame& f, AVFrame* surface_frame);  // decode thread
   void import_pending_locked();  // commit thread, holds m_
+  // True if pending_ may be presented; false (with a one-shot warning) if its
+  // size no longer matches the locked-in format and it must be dropped. Holds
+  // m_.
+  [[nodiscard]] bool pending_size_ok_locked();
+  // Pin pending_'s surface and adopt its dup'd fds as the current native frame,
+  // closing the previous one's. Holds m_; consumes pending_ (leaves it empty).
+  void promote_pending_native_locked();
+  void close_current_native_locked() noexcept;  // holds m_
 
   // One cached KMS framebuffer + its GEM handles, imported once per VASurface.
   struct FbEntry {
@@ -75,8 +103,7 @@ class VaapiDecoderSource : public DecoderSource {
   };
   void destroy_fb(FbEntry& e) const;
 
-  drm::Device& dev_;
-  int drm_fd_;
+  int drm_fd_;  // KMS fd for framebuffer import, or -1 when headless
   uint32_t coded_w_, coded_h_;
   VaapiDecoder decoder_;
 
@@ -97,6 +124,20 @@ class VaapiDecoderSource : public DecoderSource {
     uint32_t offset[4] = {0}, pitch[4] = {0};
     AVFrame* held = nullptr;
   } pending_;
+
+  // Native-frame path only: the promoted frame whose borrowed fds are handed
+  // out by acquire_native_frame. Owns the dup'd fds (closed on the next promote
+  // / at exit); the surface is pinned via retained_, exactly as the KMS import
+  // pins it.
+  struct CurrentNative {
+    bool valid = false;
+    uint32_t surface_id = 0;
+    uint32_t w = 0, h = 0, fourcc = 0;
+    uint64_t modifier = 0;
+    int nplanes = 0;
+    int fd[4] = {-1, -1, -1, -1};
+    uint32_t offset[4] = {0}, pitch[4] = {0};
+  } current_native_;
 
   // One framebuffer per surface, created once and reused (the pool is fixed).
   std::unordered_map<uint32_t, FbEntry> fb_cache_;

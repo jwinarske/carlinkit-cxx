@@ -130,3 +130,112 @@ if(LIBAV_FOUND AND LIBSWS_FOUND AND LIBDRM_FOUND AND EXISTS "${DRM_CXX_DIR}/CMak
 else()
   message(STATUS "carlinkit-kms skipped (need libav, libswscale, libdrm, the drm-cxx submodule at ${DRM_CXX_DIR} — run 'git submodule update --init --recursive' — and libva unless CARLINKIT_SOFTWARE_ONLY)")
 endif()
+
+# ── Wayland client (carlinkit-wayland) ───────────────────────────────────────
+# Presents the decoded CarPlay/AA video through a Wayland compositor instead of a
+# KMS plane, which removes the DRM-master / free-VT requirement. Built on
+# wayland-cxx-scanner (wcs), consumed the same way as drm-cxx: a source tree at
+# WAYLAND_CXX_SCANNER_DIR pulled in with add_subdirectory (it builds its scanner
+# and exports wayland-cxx::wayland-cxx + wayland_cxx_generate()). OFF by default.
+option(CARLINKIT_WAYLAND "Build the Wayland presentation client (carlinkit-wayland)" OFF)
+if(CARLINKIT_WAYLAND)
+  set(WAYLAND_CXX_SCANNER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/wayland-cxx-scanner"
+      CACHE PATH "Path to the wayland-cxx-scanner source tree")
+  pkg_check_modules(WAYLAND_CLIENT IMPORTED_TARGET wayland-client)
+  if(NOT WAYLAND_CLIENT_FOUND)
+    message(FATAL_ERROR "carlinkit-wayland: wayland-client not found")
+  endif()
+  if(NOT EXISTS "${WAYLAND_CXX_SCANNER_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR "carlinkit-wayland: wayland-cxx-scanner not found at "
+      "${WAYLAND_CXX_SCANNER_DIR} — set -DWAYLAND_CXX_SCANNER_DIR=<path>")
+  endif()
+  if(NOT (LIBAV_FOUND AND LIBDRM_FOUND AND LIBVA_FOUND AND ALSA_FOUND))
+    message(FATAL_ERROR "carlinkit-wayland: needs libav, libdrm, libva, alsa")
+  endif()
+
+  # The VAAPI decoder source inherits drm-cxx's LayerBufferSource, so the Wayland
+  # binary links drm-cxx even though it opens no KMS device. Provision it here if
+  # the KMS block above didn't already (Wayland-only build); when both targets
+  # are enabled the drm-cxx target already exists and this is skipped.
+  if(NOT TARGET drm-cxx::drm-cxx)
+    if(NOT EXISTS "${DRM_CXX_DIR}/CMakeLists.txt")
+      message(FATAL_ERROR "carlinkit-wayland: drm-cxx not found at ${DRM_CXX_DIR} "
+        "(set -DDRM_CXX_DIR=<path> or init the submodule)")
+    endif()
+    set(DRM_CXX_GSTREAMER OFF CACHE STRING "" FORCE)
+    set(DRM_CXX_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(DRM_CXX_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(DRM_CXX_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+    set(DRM_CXX_INSTALL OFF CACHE BOOL "" FORCE)
+    if(NOT EXISTS "${DRM_CXX_DIR}/subprojects/tcb-span/include")
+      find_program(MESON_EXECUTABLE meson)
+      if(MESON_EXECUTABLE)
+        execute_process(COMMAND ${MESON_EXECUTABLE} subprojects download
+                        WORKING_DIRECTORY ${DRM_CXX_DIR})
+      else()
+        message(WARNING "meson not found; run 'meson subprojects download' in ${DRM_CXX_DIR}")
+      endif()
+    endif()
+    add_subdirectory(${DRM_CXX_DIR} ${CMAKE_BINARY_DIR}/drm-cxx-build)
+  endif()
+
+  # Protocol XML from the host's wayland-protocols / wayland-scanner.
+  pkg_get_variable(WL_PROTO_DIR wayland-protocols pkgdatadir)
+  pkg_get_variable(WL_SCAN_DIR wayland-scanner pkgdatadir)
+  set(WL_CORE_XML "${WL_SCAN_DIR}/wayland.xml")
+  set(WL_XDG_XML "${WL_PROTO_DIR}/stable/xdg-shell/xdg-shell.xml")
+  set(WL_VIEWPORT_XML "${WL_PROTO_DIR}/stable/viewporter/viewporter.xml")
+  set(WL_PRESENT_XML "${WL_PROTO_DIR}/stable/presentation-time/presentation-time.xml")
+  # linux-dmabuf: the host copy must carry the v4 feedback interface. wcs's
+  # generated namespace follows the XML's protocol name, so the client is coded
+  # against linux_dmabuf_unstable_v1; require that XML rather than staging.
+  set(WL_DMABUF_XML "${WL_PROTO_DIR}/unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml")
+  if(NOT EXISTS "${WL_DMABUF_XML}")
+    message(FATAL_ERROR "carlinkit-wayland: ${WL_DMABUF_XML} not found; "
+      "wayland-protocols is missing linux-dmabuf-unstable-v1")
+  endif()
+  file(READ "${WL_DMABUF_XML}" _dmabuf_xml)
+  string(FIND "${_dmabuf_xml}" "zwp_linux_dmabuf_feedback_v1" _fb_pos)
+  if(_fb_pos EQUAL -1)
+    message(FATAL_ERROR "carlinkit-wayland: ${WL_DMABUF_XML} predates linux-dmabuf "
+      "feedback (v4); wayland-protocols is too old (need the feedback interface)")
+  endif()
+
+  add_subdirectory(${WAYLAND_CXX_SCANNER_DIR} ${CMAKE_BINARY_DIR}/wcs-build)
+
+  # VAAPI decode (headless — no KMS device) + the shared dongle/audio stack.
+  set(WL_SOURCES
+    src/main_wayland.cpp
+    src/wayland_sink.cpp
+    src/vaapi_decoder.cpp
+    src/vaapi_decoder_source.cpp
+    src/audio_alsa.cpp
+    src/usb_device.cpp
+    src/dongle.cpp
+    src/dongle_manager.cpp
+  )
+  add_executable(carlinkit-wayland ${WL_SOURCES})
+  # Generated client bindings, one header per protocol. EMIT_INTERFACE_TABLES
+  # makes each header self-contained (it defines wl_iface() rather than relying
+  # on an external interface-table symbol), which is required for the protocols
+  # not in libwayland and harmless for core.
+  wayland_cxx_generate(PROTOCOL "${WL_CORE_XML}" MODE client-header
+    EMIT_INTERFACE_TABLES OUTPUT gen/wayland_client.hpp TARGET carlinkit-wayland)
+  wayland_cxx_generate(PROTOCOL "${WL_XDG_XML}" MODE client-header
+    OUTPUT gen/xdg_shell_client.hpp TARGET carlinkit-wayland)
+  wayland_cxx_generate(PROTOCOL "${WL_DMABUF_XML}" MODE client-header
+    OUTPUT gen/linux_dmabuf_client.hpp TARGET carlinkit-wayland)
+  # viewporter and presentation-time are not in libwayland, so their interface
+  # tables must be emitted into the generated header rather than resolved
+  # against a libwayland symbol.
+  wayland_cxx_generate(PROTOCOL "${WL_VIEWPORT_XML}" MODE client-header
+    EMIT_INTERFACE_TABLES OUTPUT gen/viewporter_client.hpp TARGET carlinkit-wayland)
+  wayland_cxx_generate(PROTOCOL "${WL_PRESENT_XML}" MODE client-header
+    EMIT_INTERFACE_TABLES OUTPUT gen/presentation_time_client.hpp TARGET carlinkit-wayland)
+
+  target_link_libraries(carlinkit-wayland PRIVATE
+    wayland-cxx::wayland-cxx PkgConfig::WAYLAND_CLIENT
+    drm-cxx::drm-cxx PkgConfig::LIBAV PkgConfig::LIBVA PkgConfig::LIBDRM
+    PkgConfig::ALSA PkgConfig::LIBUSB Threads::Threads)
+  target_compile_options(carlinkit-wayland PRIVATE -Wall -Wextra)
+endif()

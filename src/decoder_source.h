@@ -21,6 +21,8 @@
 #include <memory>
 #include <optional>
 
+#include "native_frame.h"
+
 namespace drm {
 class Device;
 }  // namespace drm
@@ -88,6 +90,25 @@ class DecoderSource : public drm::scene::LayerBufferSource {
   // (and re-committing) an unchanged image every vblank. The software backend
   // bumps it per kept frame; backends with no CPU-side frame stay at 0.
   [[nodiscard]] virtual uint64_t gpu_frame_seq() const noexcept { return 0; }
+
+  // ── Presentation-neutral producer API (the FrameSink / Wayland path) ────────
+  // Distinct from the LayerBufferSource acquire() the KMS scene drives: a sink
+  // (KmsSink, WaylandSink) imports the DMA-BUF itself instead of the backend
+  // baking in a KMS framebuffer. A given binary drives exactly one of the two
+  // paths, never both, so backends may share their frame-production machinery
+  // between them. Only the DMA-BUF backends (VAAPI today) override these.
+  //
+  // Borrow the newest decoded frame as a NativeFrame. Returns false when no
+  // frame is ready. The fds are borrowed (see native_frame.h) — the sink
+  // imports before the next acquire_native_frame and never closes them.
+  [[nodiscard]] virtual bool acquire_native_frame(NativeFrame& /*out*/) {
+    return false;
+  }
+
+  // The sink is done presenting the frame at pool_slot (e.g.
+  // wl_buffer.release): the backend may recycle that pool buffer. Backends that
+  // pin frames on a fixed-depth ring may treat this as advisory; default no-op.
+  virtual void release_native_frame(uint32_t /*pool_slot*/) noexcept {}
 };
 
 // Which backend create_decoder_source should use. Auto runs the full fallback

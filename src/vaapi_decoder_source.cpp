@@ -22,7 +22,7 @@ std::unique_ptr<VaapiDecoderSource> VaapiDecoderSource::create(
     uint32_t coded_h,
     const char* render_node) {
   auto src = std::unique_ptr<VaapiDecoderSource>(
-      new VaapiDecoderSource(dev, dev.fd(), coded_w, coded_h));
+      new VaapiDecoderSource(dev.fd(), coded_w, coded_h));
   if (!src->decoder_.open(render_node))
     return nullptr;
   src->decoder_.set_frame_cb([s = src.get()](const DrmFrame& f, AVFrame* af) {
@@ -31,11 +31,22 @@ std::unique_ptr<VaapiDecoderSource> VaapiDecoderSource::create(
   return src;
 }
 
-VaapiDecoderSource::VaapiDecoderSource(drm::Device& dev,
-                                       int drm_fd,
-                                       uint32_t w,
-                                       uint32_t h)
-    : dev_(dev), drm_fd_(drm_fd), coded_w_(w), coded_h_(h) {
+std::unique_ptr<VaapiDecoderSource> VaapiDecoderSource::create_headless(
+    uint32_t coded_w,
+    uint32_t coded_h,
+    const char* render_node) {
+  auto src = std::unique_ptr<VaapiDecoderSource>(
+      new VaapiDecoderSource(-1, coded_w, coded_h));
+  if (!src->decoder_.open(render_node))
+    return nullptr;
+  src->decoder_.set_frame_cb([s = src.get()](const DrmFrame& f, AVFrame* af) {
+    s->on_decoded(f, af);
+  });
+  return src;
+}
+
+VaapiDecoderSource::VaapiDecoderSource(int drm_fd, uint32_t w, uint32_t h)
+    : drm_fd_(drm_fd), coded_w_(w), coded_h_(h) {
   fmt_.drm_fourcc = DRM_FORMAT_NV12;
   fmt_.modifier = DRM_FORMAT_MOD_INVALID;
   fmt_.width = w;
@@ -44,6 +55,7 @@ VaapiDecoderSource::VaapiDecoderSource(drm::Device& dev,
 
 VaapiDecoderSource::~VaapiDecoderSource() {
   std::lock_guard<std::mutex> lk(m_);
+  close_current_native_locked();
   for (auto& kv : fb_cache_)
     destroy_fb(kv.second);
   fb_cache_.clear();
@@ -158,10 +170,10 @@ void VaapiDecoderSource::on_decoded(const DrmFrame& f, AVFrame* surface_frame) {
   pending_ = p;
 }
 
-void VaapiDecoderSource::import_pending_locked() {
-  // Mid-stream resolution change isn't supported (the dongle Open config fixes
-  // the size); drop a differently-sized frame rather than scan out a mismatched
-  // framebuffer.
+// Mid-stream resolution change isn't supported (the dongle Open config fixes
+// the size); a differently-sized frame is dropped rather than scanned out
+// mismatched.
+bool VaapiDecoderSource::pending_size_ok_locked() {
   if (fmt_.modifier != DRM_FORMAT_MOD_INVALID &&
       (pending_.w != fmt_.width || pending_.h != fmt_.height)) {
     if (!res_warned_) {
@@ -171,6 +183,13 @@ void VaapiDecoderSource::import_pending_locked() {
                    fmt_.width, fmt_.height, pending_.w, pending_.h);
       res_warned_ = true;
     }
+    return false;
+  }
+  return true;
+}
+
+void VaapiDecoderSource::import_pending_locked() {
+  if (!pending_size_ok_locked()) {
     for (int i = 0; i < pending_.nplanes; ++i)
       if (pending_.fd[i] >= 0)
         close(pending_.fd[i]);
@@ -242,6 +261,83 @@ void VaapiDecoderSource::import_pending_locked() {
     retained_.pop_front();
   }
   pending_ = Pending{};
+}
+
+void VaapiDecoderSource::close_current_native_locked() noexcept {
+  if (!current_native_.valid)
+    return;
+  for (int i = 0; i < current_native_.nplanes; ++i)
+    if (current_native_.fd[i] >= 0)
+      close(current_native_.fd[i]);
+  current_native_ = CurrentNative{};
+}
+
+// Adopt pending_'s dup'd fds as the current native frame and pin its surface
+// via the retain ring — the same pinning the KMS import does, minus the AddFB2.
+// The borrowed fds handed out by acquire_native_frame stay valid until the next
+// promote closes them.
+void VaapiDecoderSource::promote_pending_native_locked() {
+  close_current_native_locked();
+  current_native_.valid = true;
+  current_native_.surface_id = pending_.surface_id;
+  current_native_.w = pending_.w;
+  current_native_.h = pending_.h;
+  current_native_.fourcc = pending_.fourcc;
+  current_native_.modifier = pending_.modifier;
+  current_native_.nplanes = pending_.nplanes;
+  for (int i = 0; i < pending_.nplanes && i < 4; ++i) {
+    current_native_.fd[i] =
+        pending_.fd[i];  // ownership moves to current_native_
+    current_native_.offset[i] = pending_.offset[i];
+    current_native_.pitch[i] = pending_.pitch[i];
+  }
+
+  if (fmt_.modifier == DRM_FORMAT_MOD_INVALID) {  // lock in the real format
+    fmt_.drm_fourcc = pending_.fourcc;
+    fmt_.modifier = pending_.modifier;
+    fmt_.width = pending_.w;
+    fmt_.height = pending_.h;
+  }
+
+  retained_.push_back(pending_.held);
+  pending_.held = nullptr;
+  while (retained_.size() > kRetain) {
+    av_frame_free(&retained_.front());
+    retained_.pop_front();
+  }
+  // fds moved to current_native_; drop pending_ without closing them.
+  pending_ = Pending{};
+}
+
+bool VaapiDecoderSource::acquire_native_frame(NativeFrame& out) {
+  std::lock_guard<std::mutex> lk(m_);
+  if (pending_.valid) {
+    if (!pending_size_ok_locked()) {
+      for (int i = 0; i < pending_.nplanes; ++i)
+        if (pending_.fd[i] >= 0)
+          close(pending_.fd[i]);
+      if (pending_.held)
+        av_frame_free(&pending_.held);
+      pending_ = Pending{};
+    } else {
+      promote_pending_native_locked();
+    }
+  }
+  if (!current_native_.valid)
+    return false;
+  out = NativeFrame{};
+  out.fourcc = current_native_.fourcc;
+  out.modifier = current_native_.modifier;
+  out.width = current_native_.w;
+  out.height = current_native_.h;
+  out.num_planes = static_cast<uint32_t>(current_native_.nplanes);
+  for (int i = 0; i < current_native_.nplanes && i < 4; ++i) {
+    out.planes[i].fd = current_native_.fd[i];  // borrowed
+    out.planes[i].offset = current_native_.offset[i];
+    out.planes[i].pitch = current_native_.pitch[i];
+  }
+  out.pool_slot = current_native_.surface_id;
+  return true;
 }
 
 void VaapiDecoderSource::destroy_fb(FbEntry& e) const {

@@ -118,14 +118,20 @@ wl_proxy* WaylandSink::buffer_for(const NativeFrame& frame) {
     return nullptr;
   }
 
-  wl::WlPtr<WlBufferHandler> buffer;
-  buffer.Get()->slot_ = frame.pool_slot;
-  buffer.Get()->on_release_ = &impl_->on_release;
-  buffer.Get()->released_ = false;
-  buffer.Get()->_SetProxy(buf_raw);  // installs the release listener
-  wl_proxy* proxy = buffer.Get()->GetProxy();
-  impl_->cache.emplace(frame.pool_slot, std::move(buffer));
-  return proxy;
+  // Insert the cache entry first, then bind the proxy to the map-stored
+  // handler: _SetProxy installs a dispatcher pointing at the handler's address,
+  // and WlPtr is stored by value, so binding before the move would leave the
+  // wl_buffer's dispatcher aimed at the destroyed local handler (a crash on
+  // release).
+  auto [it, inserted] =
+      impl_->cache.emplace(frame.pool_slot, wl::WlPtr<WlBufferHandler>{});
+  (void)inserted;
+  WlBufferHandler* h = it->second.Get();
+  h->slot_ = frame.pool_slot;
+  h->on_release_ = &impl_->on_release;
+  h->released_ = false;
+  h->_SetProxy(buf_raw);  // installs the release listener (stable address)
+  return h->GetProxy();
 }
 
 }  // namespace ck

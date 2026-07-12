@@ -22,7 +22,7 @@ std::unique_ptr<VaapiDecoderSource> VaapiDecoderSource::create(
     uint32_t coded_h,
     const char* render_node) {
   auto src = std::unique_ptr<VaapiDecoderSource>(
-      new VaapiDecoderSource(dev, dev.fd(), coded_w, coded_h));
+      new VaapiDecoderSource(dev.fd(), coded_w, coded_h));
   if (!src->decoder_.open(render_node))
     return nullptr;
   src->decoder_.set_frame_cb([s = src.get()](const DrmFrame& f, AVFrame* af) {
@@ -31,11 +31,22 @@ std::unique_ptr<VaapiDecoderSource> VaapiDecoderSource::create(
   return src;
 }
 
-VaapiDecoderSource::VaapiDecoderSource(drm::Device& dev,
-                                       int drm_fd,
-                                       uint32_t w,
-                                       uint32_t h)
-    : dev_(dev), drm_fd_(drm_fd), coded_w_(w), coded_h_(h) {
+std::unique_ptr<VaapiDecoderSource> VaapiDecoderSource::create_headless(
+    uint32_t coded_w,
+    uint32_t coded_h,
+    const char* render_node) {
+  auto src = std::unique_ptr<VaapiDecoderSource>(
+      new VaapiDecoderSource(-1, coded_w, coded_h));
+  if (!src->decoder_.open(render_node))
+    return nullptr;
+  src->decoder_.set_frame_cb([s = src.get()](const DrmFrame& f, AVFrame* af) {
+    s->on_decoded(f, af);
+  });
+  return src;
+}
+
+VaapiDecoderSource::VaapiDecoderSource(int drm_fd, uint32_t w, uint32_t h)
+    : drm_fd_(drm_fd), coded_w_(w), coded_h_(h) {
   fmt_.drm_fourcc = DRM_FORMAT_NV12;
   fmt_.modifier = DRM_FORMAT_MOD_INVALID;
   fmt_.width = w;

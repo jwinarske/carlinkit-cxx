@@ -149,8 +149,34 @@ if(CARLINKIT_WAYLAND)
     message(FATAL_ERROR "carlinkit-wayland: wayland-cxx-scanner not found at "
       "${WAYLAND_CXX_SCANNER_DIR} — set -DWAYLAND_CXX_SCANNER_DIR=<path>")
   endif()
-  if(NOT (LIBAV_FOUND AND LIBSWS_FOUND AND LIBDRM_FOUND))
-    message(FATAL_ERROR "carlinkit-wayland: needs libav, libswscale, libdrm")
+  if(NOT (LIBAV_FOUND AND LIBDRM_FOUND AND LIBVA_FOUND AND ALSA_FOUND))
+    message(FATAL_ERROR "carlinkit-wayland: needs libav, libdrm, libva, alsa")
+  endif()
+
+  # The VAAPI decoder source inherits drm-cxx's LayerBufferSource, so the Wayland
+  # binary links drm-cxx even though it opens no KMS device. Provision it here if
+  # the KMS block above didn't already (Wayland-only build); when both targets
+  # are enabled the drm-cxx target already exists and this is skipped.
+  if(NOT TARGET drm-cxx::drm-cxx)
+    if(NOT EXISTS "${DRM_CXX_DIR}/CMakeLists.txt")
+      message(FATAL_ERROR "carlinkit-wayland: drm-cxx not found at ${DRM_CXX_DIR} "
+        "(set -DDRM_CXX_DIR=<path> or init the submodule)")
+    endif()
+    set(DRM_CXX_GSTREAMER OFF CACHE STRING "" FORCE)
+    set(DRM_CXX_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(DRM_CXX_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(DRM_CXX_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+    set(DRM_CXX_INSTALL OFF CACHE BOOL "" FORCE)
+    if(NOT EXISTS "${DRM_CXX_DIR}/subprojects/tcb-span/include")
+      find_program(MESON_EXECUTABLE meson)
+      if(MESON_EXECUTABLE)
+        execute_process(COMMAND ${MESON_EXECUTABLE} subprojects download
+                        WORKING_DIRECTORY ${DRM_CXX_DIR})
+      else()
+        message(WARNING "meson not found; run 'meson subprojects download' in ${DRM_CXX_DIR}")
+      endif()
+    endif()
+    add_subdirectory(${DRM_CXX_DIR} ${CMAKE_BINARY_DIR}/drm-cxx-build)
   endif()
 
   # Protocol XML from the host's wayland-protocols / wayland-scanner.
@@ -177,9 +203,16 @@ if(CARLINKIT_WAYLAND)
 
   add_subdirectory(${WAYLAND_CXX_SCANNER_DIR} ${CMAKE_BINARY_DIR}/wcs-build)
 
+  # VAAPI decode (headless — no KMS device) + the shared dongle/audio stack.
   set(WL_SOURCES
     src/main_wayland.cpp
     src/wayland_sink.cpp
+    src/vaapi_decoder.cpp
+    src/vaapi_decoder_source.cpp
+    src/audio_alsa.cpp
+    src/usb_device.cpp
+    src/dongle.cpp
+    src/dongle_manager.cpp
   )
   add_executable(carlinkit-wayland ${WL_SOURCES})
   # Generated client bindings, one header per protocol. EMIT_INTERFACE_TABLES
@@ -202,6 +235,7 @@ if(CARLINKIT_WAYLAND)
 
   target_link_libraries(carlinkit-wayland PRIVATE
     wayland-cxx::wayland-cxx PkgConfig::WAYLAND_CLIENT
-    PkgConfig::LIBDRM Threads::Threads)
+    drm-cxx::drm-cxx PkgConfig::LIBAV PkgConfig::LIBVA PkgConfig::LIBDRM
+    PkgConfig::ALSA PkgConfig::LIBUSB Threads::Threads)
   target_compile_options(carlinkit-wayland PRIVATE -Wall -Wextra)
 endif()

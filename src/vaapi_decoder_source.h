@@ -30,9 +30,20 @@ namespace ck {
 class VaapiDecoderSource : public DecoderSource {
  public:
   // coded_w/h size the decoder's surface pool; should match the dongle's Open
-  // resolution. Returns nullptr on decoder-open failure.
+  // resolution. Returns nullptr on decoder-open failure. `dev` supplies the KMS
+  // fd used to import decoded frames as framebuffers for the acquire() (KMS)
+  // path.
   static std::unique_ptr<VaapiDecoderSource> create(
       drm::Device& dev,
+      uint32_t coded_w,
+      uint32_t coded_h,
+      const char* render_node = "/dev/dri/renderD128");
+
+  // Headless variant for the Wayland / FrameSink path: no KMS device — decoded
+  // frames are handed out as NativeFrames (acquire_native_frame) for a sink to
+  // import, so no drm::Device / framebuffer import is needed. The KMS acquire()
+  // path is unavailable on a source built this way.
+  static std::unique_ptr<VaapiDecoderSource> create_headless(
       uint32_t coded_w,
       uint32_t coded_h,
       const char* render_node = "/dev/dri/renderD128");
@@ -62,15 +73,17 @@ class VaapiDecoderSource : public DecoderSource {
   // skips the page flip (see main_kms's commit gate).
   [[nodiscard]] bool has_fresh_content() const noexcept override;
 
-  // ── Presentation-neutral producer (the Wayland / FrameSink path) ────────────
-  // Expose the newest decoded surface as a NativeFrame (borrowed DMA-BUF fds)
-  // instead of importing it into a KMS framebuffer. Shares the decode-side
-  // pending/retain machinery with acquire(); a given binary drives one or the
-  // other, never both.
+  // ── Presentation-neutral producer (the Wayland / FrameSink path)
+  // ──────────── Expose the newest decoded surface as a NativeFrame (borrowed
+  // DMA-BUF fds) instead of importing it into a KMS framebuffer. Shares the
+  // decode-side pending/retain machinery with acquire(); a given binary drives
+  // one or the other, never both.
   [[nodiscard]] bool acquire_native_frame(NativeFrame& out) override;
 
  private:
-  VaapiDecoderSource(drm::Device& dev, int drm_fd, uint32_t w, uint32_t h);
+  // drm_fd is the KMS device fd for the framebuffer import, or -1 for a
+  // headless (Wayland) source that never imports.
+  VaapiDecoderSource(int drm_fd, uint32_t w, uint32_t h);
   void on_decoded(const DrmFrame& f, AVFrame* surface_frame);  // decode thread
   void import_pending_locked();  // commit thread, holds m_
   // True if pending_ may be presented; false (with a one-shot warning) if its
@@ -90,8 +103,7 @@ class VaapiDecoderSource : public DecoderSource {
   };
   void destroy_fb(FbEntry& e) const;
 
-  drm::Device& dev_;
-  int drm_fd_;
+  int drm_fd_;  // KMS fd for framebuffer import, or -1 when headless
   uint32_t coded_w_, coded_h_;
   VaapiDecoder decoder_;
 

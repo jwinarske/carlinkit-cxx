@@ -85,6 +85,10 @@ wl_proxy* WaylandSink::buffer_for(const NativeFrame& frame) {
     return nullptr;
 
   if (auto it = impl_->cache.find(frame.pool_slot); it != impl_->cache.end()) {
+    // Re-attaching a buffer the compositor still holds is a protocol error;
+    // skip this frame until it releases (the decoder keeps the slot pinned).
+    if (!it->second.Get()->released_)
+      return nullptr;
     it->second.Get()->released_ = false;  // about to be attached again
     return it->second.Get()->GetProxy();
   }

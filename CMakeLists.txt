@@ -149,8 +149,8 @@ if(CARLINKIT_WAYLAND)
     message(FATAL_ERROR "carlinkit-wayland: wayland-cxx-scanner not found at "
       "${WAYLAND_CXX_SCANNER_DIR} — set -DWAYLAND_CXX_SCANNER_DIR=<path>")
   endif()
-  if(NOT (LIBAV_FOUND AND LIBDRM_FOUND AND LIBVA_FOUND AND ALSA_FOUND))
-    message(FATAL_ERROR "carlinkit-wayland: needs libav, libdrm, libva, alsa")
+  if(NOT (LIBAV_FOUND AND LIBSWS_FOUND AND LIBDRM_FOUND AND LIBVA_FOUND AND ALSA_FOUND))
+    message(FATAL_ERROR "carlinkit-wayland: needs libav, libswscale, libdrm, libva, alsa")
   endif()
 
   # The VAAPI decoder source inherits drm-cxx's LayerBufferSource, so the Wayland
@@ -203,12 +203,15 @@ if(CARLINKIT_WAYLAND)
 
   add_subdirectory(${WAYLAND_CXX_SCANNER_DIR} ${CMAKE_BINARY_DIR}/wcs-build)
 
-  # VAAPI decode (headless — no KMS device) + the shared dongle/audio stack.
+  # VAAPI decode (headless dmabuf path) + software CPU decode (wl_shm fallback)
+  # + the shared dongle/audio stack.
   set(WL_SOURCES
     src/main_wayland.cpp
     src/wayland_sink.cpp
+    src/wayland_shm_sink.cpp
     src/vaapi_decoder.cpp
     src/vaapi_decoder_source.cpp
+    src/software_decoder_source.cpp
     src/audio_alsa.cpp
     src/usb_device.cpp
     src/dongle.cpp
@@ -235,7 +238,7 @@ if(CARLINKIT_WAYLAND)
 
   target_link_libraries(carlinkit-wayland PRIVATE
     wayland-cxx::wayland-cxx PkgConfig::WAYLAND_CLIENT
-    drm-cxx::drm-cxx PkgConfig::LIBAV PkgConfig::LIBVA PkgConfig::LIBDRM
-    PkgConfig::ALSA PkgConfig::LIBUSB Threads::Threads)
+    drm-cxx::drm-cxx PkgConfig::LIBAV PkgConfig::LIBSWS PkgConfig::LIBVA
+    PkgConfig::LIBDRM PkgConfig::ALSA PkgConfig::LIBUSB Threads::Threads)
   target_compile_options(carlinkit-wayland PRIVATE -Wall -Wextra)
 endif()

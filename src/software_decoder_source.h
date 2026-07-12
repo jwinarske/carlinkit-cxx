@@ -46,6 +46,15 @@ class SoftwareDecoderSource : public DecoderSource {
                                                        uint32_t coded_h,
                                                        uint64_t rot);
 
+  // Headless variant for the Wayland / FrameSink path: no KMS device and no
+  // dumb buffers — the decoder runs in GPU-ingest mode and hands out the raw
+  // YUV420P frame via acquire_decoded_frame() for a wl_shm sink to convert and
+  // present. Rotation is the compositor's job (not baked here). Returns nullptr
+  // if the H.264 decoder cannot be opened.
+  static std::unique_ptr<SoftwareDecoderSource> create_headless(
+      uint32_t coded_w,
+      uint32_t coded_h);
+
   ~SoftwareDecoderSource() override;
 
   void submit_bitstream(const uint8_t* data,
@@ -76,11 +85,9 @@ class SoftwareDecoderSource : public DecoderSource {
   }
 
  private:
-  SoftwareDecoderSource(drm::Device& dev,
-                        int drm_fd,
-                        uint32_t w,
-                        uint32_t h,
-                        uint64_t rot);
+  // drm_fd is the KMS device fd for the dumb-buffer path, or -1 when headless
+  // (Wayland), where GPU-ingest mode replaces the dumb buffers.
+  SoftwareDecoderSource(int drm_fd, uint32_t w, uint32_t h, uint64_t rot);
   bool open_codec();
   void decode_packet(AVPacket* pkt);    // RX thread
   void on_frame(const AVFrame* frame);  // RX thread
@@ -111,8 +118,7 @@ class SoftwareDecoderSource : public DecoderSource {
   };
   void destroy_buf(Buf& b) const;
 
-  drm::Device& dev_;
-  int drm_fd_;
+  int drm_fd_;        // KMS fd for the dumb-buffer path, or -1 when headless
   uint64_t rot_ = 0;  // DRM_MODE_ROTATE_* baked into the output on the CPU
   std::vector<uint8_t> staging_{};  // NV12 at source dims; rotated into buffer
 

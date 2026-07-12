@@ -51,18 +51,27 @@ std::unique_ptr<SoftwareDecoderSource> SoftwareDecoderSource::create(
     uint32_t coded_h,
     uint64_t rot) {
   auto src = std::unique_ptr<SoftwareDecoderSource>(
-      new SoftwareDecoderSource(dev, dev.fd(), coded_w, coded_h, rot));
+      new SoftwareDecoderSource(dev.fd(), coded_w, coded_h, rot));
   if (!src->open_codec())
     return nullptr;
   return src;
 }
 
-SoftwareDecoderSource::SoftwareDecoderSource(drm::Device& dev,
-                                             int drm_fd,
+std::unique_ptr<SoftwareDecoderSource> SoftwareDecoderSource::create_headless(
+    uint32_t coded_w,
+    uint32_t coded_h) {
+  auto src = std::unique_ptr<SoftwareDecoderSource>(
+      new SoftwareDecoderSource(-1, coded_w, coded_h, DRM_MODE_ROTATE_0));
+  if (!src->open_codec() || !src->enable_gpu_ingest())
+    return nullptr;
+  return src;
+}
+
+SoftwareDecoderSource::SoftwareDecoderSource(int drm_fd,
                                              uint32_t w,
                                              uint32_t h,
                                              uint64_t rot)
-    : dev_(dev), drm_fd_(drm_fd), rot_(rot) {
+    : drm_fd_(drm_fd), rot_(rot) {
   uint32_t ow = w;
   uint32_t oh = h;
   out_dims(w, h, ow, oh);  // seed format() in final orientation pre-first-frame

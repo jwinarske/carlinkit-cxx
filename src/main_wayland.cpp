@@ -11,6 +11,7 @@
 //
 // Input, rotation tiers, and the shm software fallback are later stages; this
 // binary requires the VAAPI decode path.
+#include <linux/input-event-codes.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
 
@@ -41,6 +42,7 @@
 // included first, so shield the block from the formatter's alphabetical sort.
 // clang-format off
 #include <wayland-client-core.h>
+#include <wayland-util.h>
 
 #include "wayland_client.hpp"
 #include "xdg_shell_client.hpp"
@@ -90,6 +92,43 @@ class WlCallbackHandler
   void OnDone(uint32_t time_ms) override;
 };
 
+// Pointer: a left-button drag is mapped to a touch (down/move/up). wl_pointer
+// button events carry no position, so the last motion/enter point is tracked.
+class WlPointerHandler : public wayland::client::CWlPointer<WlPointerHandler> {
+ public:
+  App* app_ = nullptr;
+  double x_ = 0.0, y_ = 0.0;
+  void OnEnter(uint32_t, wl_proxy*, wl_fixed_t sx, wl_fixed_t sy) override {
+    x_ = wl_fixed_to_double(sx);
+    y_ = wl_fixed_to_double(sy);
+  }
+  void OnMotion(uint32_t, wl_fixed_t sx, wl_fixed_t sy) override;
+  void OnButton(uint32_t, uint32_t, uint32_t button, uint32_t state) override;
+};
+
+// Touch: the primary contact is forwarded to the dongle (single-point).
+class WlTouchHandler : public wayland::client::CWlTouch<WlTouchHandler> {
+ public:
+  App* app_ = nullptr;
+  void OnDown(uint32_t,
+              uint32_t,
+              wl_proxy*,
+              int32_t id,
+              wl_fixed_t x,
+              wl_fixed_t y) override;
+  void OnUp(uint32_t, uint32_t, int32_t id) override;
+  void OnMotion(uint32_t, int32_t id, wl_fixed_t x, wl_fixed_t y) override;
+};
+
+// Seat: create the pointer / touch handlers as the capabilities advertise them.
+class WlSeatHandler : public wayland::client::CWlSeat<WlSeatHandler> {
+ public:
+  App* app_ = nullptr;
+  wl::WlPtr<WlPointerHandler> pointer_;
+  wl::WlPtr<WlTouchHandler> touch_;
+  void OnCapabilities(uint32_t caps) override;
+};
+
 class App {
  public:
   int Run();
@@ -103,6 +142,15 @@ class App {
   void OnToplevelClose() { g_running = false; }
   void OnFrameReady(uint32_t time_ms);
 
+  // ── Input (forwarded by the seat/pointer/touch handlers) ────────────────────
+  // Surface-local coordinates map straight to the dongle's [0,1] touch space:
+  // wp_viewport makes the surface's logical size the fitted video rect.
+  void OnPointerMotion(double x, double y);
+  void OnPointerButton(double x, double y, uint32_t button, bool pressed);
+  void OnTouchDown(int32_t id, double x, double y);
+  void OnTouchMotion(int32_t id, double x, double y);
+  void OnTouchUp(int32_t id);
+
  private:
   bool Connect();
   bool ScanGlobals();
@@ -112,11 +160,14 @@ class App {
   void ReportScanout(const wl::FeedbackSnapshot& snap);
   void RenderIfReady();
   void RequestFrameCallback();
+  void SendTouchNorm(double x, double y, ck::TouchAction a);
+  void SendTouchUp();
 
   wl::DisplayHandle display_;
   wl::CRegistry registry_;
   wl::DmabufFeedback<App> dmabuf_feedback_;
   wl::PresentationManager<App> presentation_;
+  wl::WlPtr<WlSeatHandler> seat_;
 
   wl::WlPtr<WlCompositorHandler> compositor_;
   wl::WlPtr<wl::XdgWmBaseHandler> xdg_wm_base_;
@@ -129,12 +180,19 @@ class App {
 
   std::unique_ptr<ck::DecoderSource> decoder_;
   std::unique_ptr<ck::WaylandSink> sink_;
+  ck::DongleManager* mgr_ = nullptr;  // set in Run(); drives touch output
+
+  int32_t surf_w_ = 0, surf_h_ = 0;  // surface logical size (viewport dest)
+  bool ptr_down_ = false;            // pointer-drag as touch
+  int32_t touch_id_ = -1;            // primary touch contact forwarded
+  float last_nx_ = 0.5F, last_ny_ = 0.5F;  // last touch point (for a bare Up)
 
   uint32_t compositor_name_ = 0, compositor_ver_ = 0;
   uint32_t xdg_wm_base_name_ = 0, xdg_wm_base_ver_ = 0;
   uint32_t viewporter_name_ = 0, viewporter_ver_ = 0;
+  uint32_t seat_name_ = 0, seat_ver_ = 0;
   bool have_compositor_ = false, have_xdg_ = false, have_dmabuf_ = false;
-  bool have_viewporter_ = false, have_presentation_ = false;
+  bool have_viewporter_ = false, have_presentation_ = false, have_seat_ = false;
   bool surface_feedback_started_ = false;
   bool frame_pending_ = false;  // a frame callback is in flight (pacing)
   uint32_t present_seq_ = 0;
@@ -222,6 +280,10 @@ bool App::ScanGlobals() {
       viewporter_name_ = name;
       viewporter_ver_ = ver;
       have_viewporter_ = true;
+    } else if (iface == wl_seat_traits::interface_name) {
+      seat_name_ = name;
+      seat_ver_ = ver;
+      have_seat_ = true;
     } else if (iface == presentation_time::client::wp_presentation_traits::
                             interface_name) {
       presentation_.Record(name, ver);
@@ -270,6 +332,9 @@ bool App::BindGlobals() {
     return false;
   }
   have_presentation_ = presentation_.Bind(registry_, this);
+  if (have_seat_ && wl::BindHandler<wayland::client::wl_seat_traits>(
+                        registry_, seat_, seat_name_, seat_ver_))
+    seat_.Get()->app_ = this;
 
   if (dmabuf_feedback_.BoundVersion() >= 4)
     (void)dmabuf_feedback_.StartDefault(display_.Get());
@@ -392,13 +457,17 @@ void App::RenderIfReady() {
   surf->Attach(buf, 0, 0);
   surf->DamageBuffer(0, 0, static_cast<int32_t>(f.width),
                      static_cast<int32_t>(f.height));
+  // Surface logical size = the viewport destination (aspect-fitted, compositor-
+  // centered), or the buffer size when no viewport. Input maps against this.
+  surf_w_ = static_cast<int32_t>(f.width);
+  surf_h_ = static_cast<int32_t>(f.height);
   if (viewport_.Get() != nullptr && viewport_.Get()->GetProxy() != nullptr &&
       width_ > 0 && height_ > 0 && f.width > 0 && f.height > 0) {
     const double fit = std::min(static_cast<double>(width_) / f.width,
                                 static_cast<double>(height_) / f.height);
-    viewport_.Get()->SetDestination(
-        static_cast<int32_t>(std::lround(f.width * fit)),
-        static_cast<int32_t>(std::lround(f.height * fit)));
+    surf_w_ = static_cast<int32_t>(std::lround(f.width * fit));
+    surf_h_ = static_cast<int32_t>(std::lround(f.height * fit));
+    viewport_.Get()->SetDestination(surf_w_, surf_h_);
   }
   RequestFrameCallback();
   if (have_presentation_)
@@ -412,6 +481,116 @@ void App::OnFrameReady(uint32_t /*time_ms*/) {
     wl_proxy_destroy(spent);
   frame_pending_ = false;
   RenderIfReady();
+}
+
+void App::SendTouchNorm(double x, double y, ck::TouchAction a) {
+  if (mgr_ == nullptr || surf_w_ <= 0 || surf_h_ <= 0)
+    return;
+  last_nx_ = static_cast<float>(std::clamp(x / surf_w_, 0.0, 1.0));
+  last_ny_ = static_cast<float>(std::clamp(y / surf_h_, 0.0, 1.0));
+  mgr_->send_touch(last_nx_, last_ny_, a);
+}
+
+void App::SendTouchUp() {
+  // wl_touch.up carries no coordinates; release at the last known point.
+  if (mgr_ != nullptr)
+    mgr_->send_touch(last_nx_, last_ny_, ck::TouchAction::Up);
+}
+
+void App::OnPointerMotion(double x, double y) {
+  if (ptr_down_)
+    SendTouchNorm(x, y, ck::TouchAction::Move);
+}
+
+void App::OnPointerButton(double x, double y, uint32_t button, bool pressed) {
+  if (button != BTN_LEFT)
+    return;
+  ptr_down_ = pressed;
+  SendTouchNorm(x, y, pressed ? ck::TouchAction::Down : ck::TouchAction::Up);
+}
+
+void App::OnTouchDown(int32_t id, double x, double y) {
+  if (touch_id_ == -1) {  // forward the first (primary) contact only
+    touch_id_ = id;
+    SendTouchNorm(x, y, ck::TouchAction::Down);
+  }
+}
+
+void App::OnTouchMotion(int32_t id, double x, double y) {
+  if (id == touch_id_)
+    SendTouchNorm(x, y, ck::TouchAction::Move);
+}
+
+void App::OnTouchUp(int32_t id) {
+  if (id == touch_id_) {
+    touch_id_ = -1;
+    SendTouchUp();
+  }
+}
+
+// ── Seat / pointer / touch handler bodies (forward to the App)
+// ────────────────
+void WlPointerHandler::OnMotion(uint32_t, wl_fixed_t sx, wl_fixed_t sy) {
+  x_ = wl_fixed_to_double(sx);
+  y_ = wl_fixed_to_double(sy);
+  if (app_ != nullptr)
+    app_->OnPointerMotion(x_, y_);
+}
+
+void WlPointerHandler::OnButton(uint32_t,
+                                uint32_t,
+                                uint32_t button,
+                                uint32_t state) {
+  constexpr uint32_t kPressed = 1;  // WL_POINTER_BUTTON_STATE_PRESSED
+  if (app_ != nullptr)
+    app_->OnPointerButton(x_, y_, button, state == kPressed);
+}
+
+void WlTouchHandler::OnDown(uint32_t,
+                            uint32_t,
+                            wl_proxy*,
+                            int32_t id,
+                            wl_fixed_t x,
+                            wl_fixed_t y) {
+  if (app_ != nullptr)
+    app_->OnTouchDown(id, wl_fixed_to_double(x), wl_fixed_to_double(y));
+}
+
+void WlTouchHandler::OnUp(uint32_t, uint32_t, int32_t id) {
+  if (app_ != nullptr)
+    app_->OnTouchUp(id);
+}
+
+void WlTouchHandler::OnMotion(uint32_t,
+                              int32_t id,
+                              wl_fixed_t x,
+                              wl_fixed_t y) {
+  if (app_ != nullptr)
+    app_->OnTouchMotion(id, wl_fixed_to_double(x), wl_fixed_to_double(y));
+}
+
+void WlSeatHandler::OnCapabilities(uint32_t caps) {
+  using namespace wayland::client;
+  const bool has_ptr =
+      (caps & static_cast<uint32_t>(WlSeatCapability::Pointer)) != 0u;
+  const bool has_touch =
+      (caps & static_cast<uint32_t>(WlSeatCapability::Touch)) != 0u;
+  if (has_ptr && pointer_.IsNull()) {
+    if (wl_proxy* raw =
+            wl::construct<wl_pointer_traits, wl_seat_traits::Op::GetPointer>(
+                *this)) {
+      pointer_.Get()->app_ = app_;
+      pointer_.Get()->_SetProxy(raw);
+    }
+  }
+  if (has_touch && touch_.IsNull()) {
+    if (wl_proxy* raw =
+            wl::construct<wl_touch_traits, wl_seat_traits::Op::GetTouch>(
+                *this)) {
+      touch_.Get()->app_ = app_;
+      touch_.Get()->_SetProxy(raw);
+    }
+  }
 }
 
 int App::Run() {
@@ -471,6 +650,7 @@ int App::Run() {
 
   ck::DongleManager manager(cfg, sink);
   mgr = &manager;
+  mgr_ = &manager;  // drives touch output from the input hooks
   std::fprintf(stderr, "waiting for dongle + phone (wifi+BT on, nearby)...\n");
   manager.start();
   std::fprintf(stderr, "carlinkit-wayland: presenting — Ctrl-C to quit\n");

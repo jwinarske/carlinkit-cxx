@@ -13,6 +13,7 @@
 // binary requires the VAAPI decode path.
 #include <linux/input-event-codes.h>
 #include <sys/eventfd.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -23,10 +24,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <string>
 #include <string_view>
 #include <vector>
 
 #include <drm_fourcc.h>
+#include <xf86drm.h>
 
 #include "audio_alsa.h"
 #include "config_env.h"
@@ -71,6 +74,35 @@ void on_sigint(int) {
 
 constexpr int kRoundtripTimeoutMs = 5000;
 constexpr uint32_t kVideoFourcc = DRM_FORMAT_NV12;
+
+// The render-node path for the DRM device the compositor decodes/scans out on
+// (dmabuf feedback's main_device, a dev_t), or empty if none matches. Decoding
+// on this device avoids a silent compositor-side cross-device copy that would
+// defeat zero-copy. `want` is matched against every node of each DRM device.
+std::string render_node_for_device(dev_t want) {
+  if (want == 0)
+    return {};
+  drmDevicePtr devs[16];
+  const int n = drmGetDevices2(0, devs, 16);
+  if (n <= 0)
+    return {};
+  std::string result;
+  for (int i = 0; i < n && result.empty(); ++i) {
+    drmDevicePtr d = devs[i];
+    bool match = false;
+    for (int node = 0; node < DRM_NODE_MAX && !match; ++node) {
+      if ((d->available_nodes & (1 << node)) == 0)
+        continue;
+      struct stat st{};
+      if (stat(d->nodes[node], &st) == 0 && st.st_rdev == want)
+        match = true;
+    }
+    if (match && (d->available_nodes & (1 << DRM_NODE_RENDER)) != 0)
+      result = d->nodes[DRM_NODE_RENDER];
+  }
+  drmFreeDevices(devs, n);
+  return result;
+}
 
 class App;
 
@@ -143,7 +175,7 @@ class App {
   void OnFrameReady(uint32_t time_ms);
 
   // ── Input (forwarded by the seat/pointer/touch handlers) ────────────────────
-  // Surface-local coordinates map straight to the dongle's [0,1] touch space:
+  // Surface-local coords map straight to the dongle's [0,1] touch space:
   // wp_viewport makes the surface's logical size the fitted video rect.
   void OnPointerMotion(double x, double y);
   void OnPointerButton(double x, double y, uint32_t button, bool pressed);
@@ -413,11 +445,36 @@ bool App::CreateSurface() {
 }
 
 bool App::StartDecode() {
-  const char* node = std::getenv("CARLINKIT_VAAPI_NODE");
   ck::DongleConfig cfg;
   ck::apply_box_env(cfg);
-  decoder_ = ck::VaapiDecoderSource::create_headless(
-      cfg.width, cfg.height, node != nullptr ? node : "/dev/dri/renderD128");
+
+  // Prefer the render node of the compositor's main_device so the decoder and
+  // the compositor share a GPU (no cross-device copy). CARLINKIT_VAAPI_NODE
+  // overrides; a mismatch against main_device is warned as a possible copy.
+  const dev_t main_dev = dmabuf_feedback_.Current().main_device;
+  const std::string matched = render_node_for_device(main_dev);
+  std::string node;
+  if (const char* env = std::getenv("CARLINKIT_VAAPI_NODE"); env != nullptr) {
+    node = env;
+    if (!matched.empty() && matched != node)
+      std::fprintf(stderr,
+                   "[vaapi] CARLINKIT_VAAPI_NODE=%s differs from the "
+                   "compositor's device (%s) — possible cross-device copy\n",
+                   node.c_str(), matched.c_str());
+  } else if (!matched.empty()) {
+    node = matched;
+  } else {
+    node = "/dev/dri/renderD128";
+    if (main_dev != 0)
+      std::fprintf(stderr,
+                   "[vaapi] no render node matches the compositor's "
+                   "main_device; using %s (possible cross-device copy)\n",
+                   node.c_str());
+  }
+  std::fprintf(stderr, "[vaapi] render node: %s\n", node.c_str());
+
+  decoder_ = ck::VaapiDecoderSource::create_headless(cfg.width, cfg.height,
+                                                     node.c_str());
   if (decoder_ == nullptr) {
     std::fprintf(stderr, "VAAPI decoder open failed (need a render node)\n");
     return false;
